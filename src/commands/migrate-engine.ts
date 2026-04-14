@@ -22,6 +22,25 @@ interface MigrateOpts {
   force: boolean;
 }
 
+function normalizeEmbedding(value: unknown): Float32Array | undefined {
+  if (!value) return undefined;
+  if (value instanceof Float32Array) return value;
+  if (Array.isArray(value)) return new Float32Array(value.map(Number));
+  if (typeof value === 'string') {
+    try {
+      const parsed = JSON.parse(value);
+      if (Array.isArray(parsed)) return new Float32Array(parsed.map(Number));
+    } catch {
+      const trimmed = value.trim();
+      if (trimmed.startsWith('[') && trimmed.endsWith(']')) {
+        const nums = trimmed.slice(1, -1).split(',').map(s => Number(s.trim())).filter(n => Number.isFinite(n));
+        if (nums.length > 0) return new Float32Array(nums);
+      }
+    }
+  }
+  return undefined;
+}
+
 function parseArgs(args: string[]): MigrateOpts {
   const toIdx = args.indexOf('--to');
   if (toIdx === -1 || !args[toIdx + 1]) {
@@ -183,7 +202,7 @@ export async function runMigrateEngine(sourceEngine: BrainEngine, args: string[]
         chunk_index: c.chunk_index,
         chunk_text: c.chunk_text,
         chunk_source: c.chunk_source,
-        embedding: c.embedding || undefined,
+        embedding: normalizeEmbedding(c.embedding),
         model: c.model,
         token_count: c.token_count || undefined,
       })), sourceOpts);
