@@ -68,12 +68,29 @@ export class PostgresEngine implements BrainEngine {
     // on DDL statements (DROP TRIGGER + CREATE TRIGGER acquire AccessExclusiveLock)
     await conn`SELECT pg_advisory_lock(42)`;
     try {
-      await conn.unsafe(SCHEMA_SQL);
+      let schemaBootstrapped = false;
+      try {
+        await conn.unsafe(SCHEMA_SQL);
+        schemaBootstrapped = true;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        if (!/column\s+"?(link_source|origin_page_id|origin_field)"?\s+does not exist/i.test(msg)) {
+          throw e;
+        }
+        // Legacy brains on schema v4-v10 can fail here because schema.sql now
+        // references provenance columns before the numbered migrations add them.
+        // Run the embedded migrations first, then re-apply schema.sql.
+        console.warn(`[gbrain] initSchema bootstrap fallback: ${msg}`);
+      }
 
       // Run any pending migrations automatically
       const { applied } = await runMigrations(this);
       if (applied > 0) {
         console.log(`  ${applied} migration(s) applied`);
+      }
+
+      if (!schemaBootstrapped) {
+        await conn.unsafe(SCHEMA_SQL);
       }
     } finally {
       await conn`SELECT pg_advisory_unlock(42)`;

@@ -36,12 +36,12 @@ import type { Migration, OrchestratorOpts, OrchestratorResult, OrchestratorPhase
 // and swaps the unique constraint. Schema build time on 46K pages is
 // ~10s (ALTER + index builds). Bumped timeout accounts for slow Supabase
 // links (v0.12.1 pattern — migrations can time out on the 60s default).
-// Use the CURRENTLY-RUNNING binary path (not `gbrain` off $PATH). After
-// `gbrain upgrade` rewrites the binary, a bare `gbrain` could resolve to
-// an older installed copy via alias shadowing or stale PATH cache. The
-// active process.execPath is the one that loaded THIS migration module,
-// so recursing into it is always the right binary.
-const GBRAIN = process.execPath;
+// Use the actual argv entrypoint when available. On this machine, gbrain runs via
+// a bun shebang, so process.execPath is the Bun binary, not the gbrain CLI.
+// `bun extract ...` is nonsense; `bun /path/to/gbrain extract ...` works.
+const GBRAIN = process.argv[1]
+  ? `${process.execPath} ${JSON.stringify(process.argv[1])}`
+  : 'gbrain';
 
 function phaseASchema(opts: OrchestratorOpts): OrchestratorPhaseResult {
   if (opts.dryRun) return { name: 'schema', status: 'skipped', detail: 'dry-run' };
