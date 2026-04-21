@@ -57,6 +57,10 @@ export async function connect(config: EngineConfig): Promise<void> {
       max: resolvePoolSize(),
       idle_timeout: 20,
       connect_timeout: 10,
+      // Supabase pooler can invalidate prepared statements across long-lived
+      // sync/import runs. Disable prepares on this runtime to avoid
+      // `prepared statement ... does not exist` during large syncs.
+      prepare: false,
       types: {
         // Register pgvector type
         bigint: postgres.BigInt,

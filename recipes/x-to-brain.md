@@ -11,10 +11,10 @@ secrets:
     where: https://developer.x.com/en/portal/dashboard — create a project + app, copy the Bearer Token from "Keys and tokens"
 health_checks:
   - type: http
-    url: "https://api.x.com/2/users/me"
+    url: "https://api.x.com/2/users/by/username/XDevelopers"
     auth: bearer
     auth_token: "$X_BEARER_TOKEN"
-    label: "X API"
+    label: "X API app-only auth"
 setup_time: 15 min
 cost_estimate: "$0-200/mo (Free tier: 1 app, read-only. Basic: $200/mo for search + higher limits)"
 ---
@@ -117,12 +117,13 @@ gives search/recent endpoint and higher limits. Pro tier gets full archive searc
 
 Validate immediately:
 ```bash
-curl -sf -H "Authorization: Bearer $X_BEARER_TOKEN" \
-  "https://api.x.com/2/users/me" \
+curl -sf -H "Authorization: Bearer ***" \
+  "https://api.x.com/2/users/by/username/XDevelopers" \
   && echo "PASS: X API connected" \
   || echo "FAIL: X API token invalid"
 ```
 
+Use a bearer-compatible read endpoint for validation. `/2/users/me` requires user-context auth and will return 403 for valid app-only bearer tokens.
 **If validation fails:** "That didn't work. Common issues: (1) make sure you copied
 the Bearer Token, not the API Key or API Secret, (2) Bearer Tokens are long strings
 starting with 'AAA...', (3) if you just created the app, the token is valid immediately."

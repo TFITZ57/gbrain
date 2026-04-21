@@ -41,6 +41,9 @@ export class PostgresEngine implements BrainEngine {
         max: size,
         idle_timeout: 20,
         connect_timeout: 10,
+        // Supabase pooler can invalidate prepared statements during
+        // multi-worker sync/import workloads.
+        prepare: false,
         types: { bigint: postgres.BigInt },
       });
       await this._sql`SELECT 1`;

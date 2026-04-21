@@ -573,15 +573,15 @@ function checkSecrets(secrets: RecipeSecret[]): { set: string[]; missing: Recipe
 type IntegrationStatus = 'available' | 'configured' | 'active';
 
 function getStatus(recipe: ParsedRecipe): IntegrationStatus {
-  const { set, missing } = checkSecrets(recipe.frontmatter.secrets);
-  // All required secrets must be set to be "configured"
-  if (missing.length > 0) return 'available';
-
   const heartbeat = readHeartbeat(recipe.frontmatter.id);
   const recentEvents = heartbeat.filter(e =>
     Date.now() - new Date(e.ts).getTime() < 24 * 60 * 60 * 1000
   );
   if (recentEvents.length > 0) return 'active';
+
+  const { set, missing } = checkSecrets(recipe.frontmatter.secrets);
+  // All required secrets must be set to be "configured"
+  if (missing.length > 0) return 'available';
 
   return 'configured';
 }
