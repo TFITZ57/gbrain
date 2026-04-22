@@ -99,3 +99,7 @@ These apply to ALL brain-writing skills:
 - `skills/conventions/subagent-routing.md` — when to use Minions vs inline work
 - `skills/_brain-filing-rules.md` — where files go
 - `skills/_output-rules.md` — output quality standards
+
+Specific routing note:
+- if the user asks specifically to fix, audit, or repair citations, prefer `skills/citation-fixer/SKILL.md`
+- use `skills/maintain/SKILL.md` for broader brain health and maintenance runs where citations are only one dimension among many

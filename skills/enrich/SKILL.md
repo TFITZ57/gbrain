@@ -36,12 +36,8 @@ This skill guarantees:
 - No stubs: every new page has meaningful content from web search or existing brain context
 
 > **Filing rule:** Read `skills/_brain-filing-rules.md` before creating any new page.
-
-## Iron Law: Back-Linking (MANDATORY)
-
-Every mention of a person or company with a brain page MUST create a back-link
-FROM that entity's page TO the page mentioning them. An unlinked mention is a
-broken brain. See `skills/_brain-filing-rules.md` for format.
+>
+> **Convention:** See `skills/conventions/quality.md` for Iron Law back-linking, citation rules, and source precedence.
 
 ## Philosophy
 
@@ -49,37 +45,11 @@ A brain page should read like an intelligence dossier, not a LinkedIn scrape.
 Facts are table stakes. Texture is the value -- what do they believe, what are
 they building, what makes them tick, where are they headed.
 
-## Citation Requirements (MANDATORY)
+## Citation and notability rules
 
-Every fact must carry an inline `[Source: ...]` citation.
-
-Three formats:
-- **Direct attribution:** `[Source: User, {context}, YYYY-MM-DD]`
-- **API/external:** `[Source: {provider} enrichment, YYYY-MM-DD]`
-- **Synthesis:** `[Source: compiled from {list of sources}]`
-
-Source precedence (highest to lowest):
-1. User's direct statements
-2. Compiled truth (pre-existing brain synthesis)
-3. Timeline entries (raw evidence)
-4. External sources (API enrichment, web search)
-
-When sources conflict, note the contradiction with both citations.
-
-## When To Enrich
-
-### Primary triggers
-- User mentions an entity in conversation
-- Entity appears in a meeting transcript or email
-- New contact appears with significant context
-- Entity makes news or has a major event
-- Any ingest pipeline encounters a notable entity
-
-### Do NOT enrich
-- Random mentions with no relationship signal
-- Bot/spam accounts
-- Entities with no substantive connection to the user's work
-- Same page enriched within the past week (unless new signal warrants it)
+> **Convention:** See `skills/conventions/quality.md` for citation format, source precedence, and contradiction handling.
+>
+> **Filing rule:** See `skills/_brain-filing-rules.md` for notability thresholds, creation rules, and when *not* to enrich a weak entity mention.
 
 ## Enrichment Tiers
 
