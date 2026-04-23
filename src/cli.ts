@@ -6,6 +6,12 @@ import type { BrainEngine } from './core/engine.ts';
 import { operations, OperationError } from './core/operations.ts';
 import type { Operation, OperationContext } from './core/operations.ts';
 import { serializeMarkdown } from './core/markdown.ts';
+import {
+  buildCliCommandTelemetry,
+  parseHermesCallerContext,
+  resolveCliCommandIdentity,
+  withCliCommandTelemetry,
+} from './core/cli-telemetry.ts';
 import { VERSION } from './version.ts';
 
 // Build CLI name -> operation lookup
@@ -20,86 +26,102 @@ for (const op of operations) {
 // CLI-only commands that bypass the operation layer
 const CLI_ONLY = new Set(['init', 'upgrade', 'post-upgrade', 'check-update', 'integrations', 'publish', 'check-backlinks', 'lint', 'report', 'import', 'export', 'files', 'embed', 'serve', 'call', 'config', 'doctor', 'migrate', 'eval', 'sync', 'extract', 'features', 'autopilot', 'graph-query', 'jobs', 'apply-migrations', 'skillpack-check', 'resolvers', 'integrity', 'repair-jsonb', 'orphans']);
 
-async function main() {
+async function main(): Promise<number> {
   const args = process.argv.slice(2);
-  let command = args[0];
+  const rawCommand = args[0] || '';
+  let command = rawCommand;
+  let aliasApplied: string | undefined;
 
-  if (!command || command === '--help' || command === '-h') {
-    printHelp();
-    return;
-  }
-
-  if (command === '--version' || command === 'version') {
-    console.log(`gbrain ${VERSION}`);
-    return;
-  }
-
-  if (command === '--tools-json') {
-    const { printToolsJson } = await import('./commands/tools-json.ts');
-    printToolsJson();
-    return;
-  }
-
-  const subArgs = args.slice(1);
-
-  // DX alias: `ask` is a natural-language alias for `query`
   if (command === 'ask') {
+    aliasApplied = 'ask';
     command = 'query';
   }
 
-  // Per-command --help
-  if (subArgs.includes('--help') || subArgs.includes('-h')) {
-    const op = cliOps.get(command);
-    if (op) {
-      printOpHelp(op);
-      return;
+  const subArgs = args.slice(1);
+  const { commandCanonical, commandKind } = resolveCliCommandIdentity(
+    rawCommand,
+    command,
+    CLI_ONLY,
+    new Set(cliOps.keys()),
+  );
+
+  const telemetry = buildCliCommandTelemetry({
+    rawCommand: rawCommand || commandCanonical,
+    canonicalCommand: commandCanonical,
+    commandKind,
+    subArgs,
+    aliasApplied,
+    callerContext: parseHermesCallerContext(),
+  });
+
+  return withCliCommandTelemetry(telemetry, async () => {
+    if (!rawCommand || rawCommand === '--help' || rawCommand === '-h') {
+      printHelp();
+      return 0;
     }
-  }
 
-  // CLI-only commands
-  if (CLI_ONLY.has(command)) {
-    await handleCliOnly(command, subArgs);
-    return;
-  }
+    if (command === '--version' || command === 'version') {
+      console.log(`gbrain ${VERSION}`);
+      return 0;
+    }
 
-  // Shared operations
-  const op = cliOps.get(command);
-  if (!op) {
-    console.error(`Unknown command: ${command}`);
-    console.error('Run gbrain --help for available commands.');
-    process.exit(1);
-  }
+    if (command === '--tools-json') {
+      const { printToolsJson } = await import('./commands/tools-json.ts');
+      printToolsJson();
+      return 0;
+    }
 
-  const engine = await connectEngine();
-  try {
-    const params = parseOpArgs(op, subArgs);
-
-    // Validate required params before calling handler
-    for (const [key, def] of Object.entries(op.params)) {
-      if (def.required && params[key] === undefined) {
-        const cliName = op.cliHints?.name || op.name;
-        const positional = op.cliHints?.positional || [];
-        const usage = positional.map(p => `<${p}>`).join(' ');
-        console.error(`Usage: gbrain ${cliName} ${usage}`);
-        process.exit(1);
+    if (subArgs.includes('--help') || subArgs.includes('-h')) {
+      const op = cliOps.get(command);
+      if (op) {
+        printOpHelp(op);
+        return 0;
       }
     }
 
-    const ctx = makeContext(engine, params);
-    const result = await op.handler(ctx, params);
-    const output = formatResult(op.name, result);
-    if (output) process.stdout.write(output);
-  } catch (e: unknown) {
-    if (e instanceof OperationError) {
-      console.error(`Error [${e.code}]: ${e.message}`);
-      if (e.suggestion) console.error(`  Fix: ${e.suggestion}`);
-      process.exit(1);
+    if (CLI_ONLY.has(command)) {
+      await handleCliOnly(command, subArgs);
+      return 0;
     }
-    console.error(e instanceof Error ? e.message : String(e));
-    process.exit(1);
-  } finally {
-    await engine.disconnect();
-  }
+
+    const op = cliOps.get(command);
+    if (!op) {
+      console.error(`Unknown command: ${command}`);
+      console.error('Run gbrain --help for available commands.');
+      return 1;
+    }
+
+    const engine = await connectEngine();
+    try {
+      const params = parseOpArgs(op, subArgs);
+
+      for (const [key, def] of Object.entries(op.params)) {
+        if (def.required && params[key] === undefined) {
+          const cliName = op.cliHints?.name || op.name;
+          const positional = op.cliHints?.positional || [];
+          const usage = positional.map(p => `<${p}>`).join(' ');
+          console.error(`Usage: gbrain ${cliName} ${usage}`);
+          return 1;
+        }
+      }
+
+      const ctx = makeContext(engine, params);
+      const result = await op.handler(ctx, params);
+      const output = formatResult(op.name, result);
+      if (output) process.stdout.write(output);
+      return 0;
+    } catch (e: unknown) {
+      if (e instanceof OperationError) {
+        console.error(`Error [${e.code}]: ${e.message}`);
+        if (e.suggestion) console.error(`  Fix: ${e.suggestion}`);
+        return 1;
+      }
+      console.error(e instanceof Error ? e.message : String(e));
+      return 1;
+    } finally {
+      await engine.disconnect();
+    }
+  });
 }
 
 function parseOpArgs(op: Operation, args: string[]): Record<string, unknown> {
@@ -573,7 +595,11 @@ Run gbrain <command> --help for command-specific help.
 `);
 }
 
-main().catch(e => {
-  console.error(e.message || e);
-  process.exit(1);
-});
+main()
+  .then((exitCode) => {
+    process.exit(typeof exitCode === 'number' ? exitCode : 0);
+  })
+  .catch((e) => {
+    console.error(e instanceof Error ? e.message : String(e));
+    process.exit(1);
+  });
