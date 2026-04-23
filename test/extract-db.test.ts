@@ -46,6 +46,42 @@ const meetingPage = (title: string, body = ''): PageInput => ({
 describe('gbrain extract links --source db', () => {
   beforeEach(truncateAll);
 
+  test('extracts links from job frontmatter canonical refs', async () => {
+    await engine.putPage('companies/skyways-charter', companyPage('Skyways Charter'));
+    await engine.putPage('aircraft/n626ct', {
+      type: 'source' as any,
+      title: 'N626CT',
+      compiled_truth: '',
+      timeline: '',
+    });
+    await engine.putPage('deals/invoice-108-n626ct', {
+      type: 'deal',
+      title: 'Invoice 108 N626CT',
+      compiled_truth: '',
+      timeline: '',
+    });
+    await engine.putPage('jobs/2024-07-25-n626ct-job-108', {
+      type: 'source' as any,
+      title: '2024-07-25 N626CT job 108',
+      compiled_truth: '',
+      timeline: '',
+      frontmatter: {
+        company_ref: 'companies/skyways-charter',
+        aircraft_ref: 'aircraft/n626ct',
+        deal_refs: ['deals/invoice-108-n626ct'],
+      },
+    });
+
+    await runExtract(engine, ['links', '--source', 'db', '--include-frontmatter']);
+
+    const links = await engine.getLinks('jobs/2024-07-25-n626ct-job-108');
+    expect(links).toEqual(expect.arrayContaining([
+      expect.objectContaining({ to_slug: 'companies/skyways-charter', link_type: 'related_to' }),
+      expect.objectContaining({ to_slug: 'aircraft/n626ct', link_type: 'related_to' }),
+      expect.objectContaining({ to_slug: 'deals/invoice-108-n626ct', link_type: 'related_to' }),
+    ]));
+  });
+
   test('extracts links from meeting page with attendee refs', async () => {
     await engine.putPage('people/alice', personPage('Alice'));
     await engine.putPage('people/bob', personPage('Bob'));

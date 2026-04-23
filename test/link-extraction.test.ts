@@ -343,13 +343,38 @@ describe('isAutoLinkEnabled', () => {
  * inputs (no pg_trgm, no searchPages).
  */
 function makeFixtureResolver(pages: Record<string, string>): SlugResolver {
+  const externalToCanonical = (name: string): string | null => {
+    if (name.startsWith('quickbooks:')) {
+      const parts = name.split(':');
+      if (parts.length >= 3) {
+        const kind = parts[1].replace(/_/g, '-').toLowerCase();
+        const id = parts.slice(2).join(':').trim();
+        return id ? `sources/quickbooks/${kind}/${id}` : null;
+      }
+    }
+    if (name.startsWith('email-thread:')) {
+      const raw = name.slice('email-thread:'.length);
+      const parts = raw.replace(/\.md$/i, '').split('/').map(part => part
+        .toLowerCase()
+        .replace(/[^a-z0-9.\s_-]/g, '')
+        .replace(/[\s]+/g, '-')
+        .replace(/-+/g, '-')
+        .replace(/^-|-$/g, ''))
+        .filter(Boolean);
+      return parts.length > 0 ? `sources/email-thread/${parts.join('/')}` : null;
+    }
+    return null;
+  };
+
   return {
     async resolve(name: string, dirHint?: string | string[]) {
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
       // Already a slug — check if present.
-      if (/^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(name)) {
+      if (/^[a-z][a-z0-9-]*(?:\/[a-z0-9][a-z0-9-]*)+$/.test(name)) {
         return pages[name] ?? null;
       }
+      const canonicalExternal = externalToCanonical(name);
+      if (canonicalExternal && pages[canonicalExternal]) return canonicalExternal;
       const slugified = name.toLowerCase().replace(/\s+/g, '-');
       for (const hint of hints) {
         if (!hint) continue;
@@ -366,12 +391,23 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
     'people/pedro': 'people/pedro',
     'people/garry': 'people/garry',
     'people/diana-hu': 'people/diana-hu',
+    'people/jane-doe': 'people/jane-doe',
     'companies/stripe': 'companies/stripe',
     'companies/brex': 'companies/brex',
     'companies/sequoia': 'companies/sequoia',
     'companies/benchmark': 'companies/benchmark',
+    'companies/skyways-charter': 'companies/skyways-charter',
+    'aircraft/n626ct': 'aircraft/n626ct',
+    'airport/kteb': 'airport/kteb',
     'meetings/2026-04-03': 'meetings/2026-04-03',
     'deal/riveter-seed': 'deal/riveter-seed',
+    'deals/invoice-108-n626ct': 'deals/invoice-108-n626ct',
+    'jobs/2024-07-25-n626ct-job-108': 'jobs/2024-07-25-n626ct-job-108',
+    'source/email-latest': 'source/email-latest',
+    'sources/quickbooks/invoice/1909': 'sources/quickbooks/invoice/1909',
+    'sources/quickbooks/project-customer/461': 'sources/quickbooks/project-customer/461',
+    'sources/email-thread/contour-aviation/n257pl/2026-03-25-dispatch': 'sources/email-thread/contour-aviation/n257pl/2026-03-25-dispatch',
+    'sources/email-thread/_unclassified/n116fe/2025-10-30-n116fe': 'sources/email-thread/_unclassified/n116fe/2025-10-30-n116fe',
   };
   const resolver = makeFixtureResolver(pages);
 
@@ -452,6 +488,100 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
     expect(src!.targetSlug).toBe('meetings/2026-04-03');
   });
 
+  test('local canonical _ref/_refs fields → outgoing related/source edges', async () => {
+    const { candidates, unresolved } = await extractFrontmatterLinks(
+      'jobs/2024-07-25-n626ct-job-108', 'job' as never,
+      {
+        company_ref: 'companies/skyways-charter',
+        aircraft_ref: 'aircraft/n626ct',
+        airport_ref: 'airport/kteb',
+        deal_refs: ['deals/invoice-108-n626ct'],
+        contact_refs: ['people/jane-doe'],
+        source_refs: ['source/email-latest', 'quickbooks:invoice:12'],
+      },
+      resolver,
+    );
+
+    expect(candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        fromSlug: 'jobs/2024-07-25-n626ct-job-108',
+        targetSlug: 'companies/skyways-charter',
+        linkType: 'related_to',
+        originField: 'company_ref',
+      }),
+      expect.objectContaining({
+        fromSlug: 'jobs/2024-07-25-n626ct-job-108',
+        targetSlug: 'aircraft/n626ct',
+        linkType: 'related_to',
+        originField: 'aircraft_ref',
+      }),
+      expect.objectContaining({
+        fromSlug: 'jobs/2024-07-25-n626ct-job-108',
+        targetSlug: 'airport/kteb',
+        linkType: 'related_to',
+        originField: 'airport_ref',
+      }),
+      expect.objectContaining({
+        fromSlug: 'jobs/2024-07-25-n626ct-job-108',
+        targetSlug: 'deals/invoice-108-n626ct',
+        linkType: 'related_to',
+        originField: 'deal_refs',
+      }),
+      expect.objectContaining({
+        fromSlug: 'jobs/2024-07-25-n626ct-job-108',
+        targetSlug: 'people/jane-doe',
+        linkType: 'related_to',
+        originField: 'contact_refs',
+      }),
+      expect.objectContaining({
+        fromSlug: 'jobs/2024-07-25-n626ct-job-108',
+        targetSlug: 'source/email-latest',
+        linkType: 'source',
+        originField: 'source_refs',
+      }),
+    ]));
+    expect(unresolved).toContainEqual({ field: 'source_refs', name: 'quickbooks:invoice:12' });
+  });
+
+  test('normalizes external source refs to canonical source page slugs', async () => {
+    const { candidates, unresolved } = await extractFrontmatterLinks(
+      'jobs/2024-07-25-n626ct-job-108', 'job' as never,
+      {
+        source_refs: [
+          'quickbooks:invoice:1909',
+          'quickbooks:project_customer:461',
+          'email-thread:Contour Aviation/N257PL/2026-03-25-dispatch.md',
+          'email-thread:_Unclassified/N116FE/2025-10-30-n116fe.md',
+        ],
+      },
+      resolver,
+    );
+
+    expect(candidates).toEqual(expect.arrayContaining([
+      expect.objectContaining({
+        targetSlug: 'sources/quickbooks/invoice/1909',
+        linkType: 'source',
+        originField: 'source_refs',
+      }),
+      expect.objectContaining({
+        targetSlug: 'sources/quickbooks/project-customer/461',
+        linkType: 'source',
+        originField: 'source_refs',
+      }),
+      expect.objectContaining({
+        targetSlug: 'sources/email-thread/contour-aviation/n257pl/2026-03-25-dispatch',
+        linkType: 'source',
+        originField: 'source_refs',
+      }),
+      expect.objectContaining({
+        targetSlug: 'sources/email-thread/_unclassified/n116fe/2025-10-30-n116fe',
+        linkType: 'source',
+        originField: 'source_refs',
+      }),
+    ]));
+    expect(unresolved).toEqual([]);
+  });
+
   test('unresolvable name goes to unresolved list, not candidates', async () => {
     const { candidates, unresolved } = await extractFrontmatterLinks(
       'meetings/x', 'meeting' as never,
@@ -460,6 +590,16 @@ describe('extractFrontmatterLinks — field-map coverage', () => {
     expect(candidates).toHaveLength(1);
     expect(unresolved).toHaveLength(1);
     expect(unresolved[0]).toEqual({ field: 'attendees', name: 'Unknown Person' });
+  });
+
+  test('self-resolving source_ref is skipped instead of creating a self-link', async () => {
+    const selfResolver: SlugResolver = { resolve: async () => 'deals/invoice-196-n329md' };
+    const { candidates, unresolved } = await extractFrontmatterLinks(
+      'deals/invoice-196-n329md', 'deal' as never,
+      { source_refs: ['quickbooks:invoice:1411'] }, selfResolver,
+    );
+    expect(candidates).toEqual([]);
+    expect(unresolved).toEqual([]);
   });
 
   test('bad types (number, null, empty) skipped silently', async () => {
@@ -506,11 +646,13 @@ describe('makeResolver — fallback chain', () => {
   function makeFakeEngine(
     slugs: string[],
     fuzzyMap: Map<string, { slug: string; similarity: number }> = new Map(),
+    externalRefMap: Map<string, Array<{ slug: string; type?: string }>> = new Map(),
   ): BrainEngine {
     const lookup = new Set(slugs);
     let getPageCalls = 0;
     let fuzzyCalls = 0;
     let searchCalls = 0;
+    let executeRawCalls = 0;
     const engine = {
       async getPage(slug: string) {
         getPageCalls++;
@@ -524,8 +666,13 @@ describe('makeResolver — fallback chain', () => {
         searchCalls++;
         return [];
       },
+      async executeRaw(_sql: string, params?: unknown[]) {
+        executeRawCalls++;
+        const ref = String(params?.[0] ?? '');
+        return (externalRefMap.get(ref) ?? []) as any;
+      },
     } as unknown as BrainEngine;
-    (engine as any)._counts = () => ({ getPageCalls, fuzzyCalls, searchCalls });
+    (engine as any)._counts = () => ({ getPageCalls, fuzzyCalls, searchCalls, executeRawCalls });
     return engine;
   }
 
@@ -533,6 +680,12 @@ describe('makeResolver — fallback chain', () => {
     const engine = makeFakeEngine(['people/pedro']);
     const r = makeResolver(engine);
     expect(await r.resolve('people/pedro')).toBe('people/pedro');
+  });
+
+  test('step 1: nested slug passthrough', async () => {
+    const engine = makeFakeEngine(['sources/email/email-latest']);
+    const r = makeResolver(engine);
+    expect(await r.resolve('sources/email/email-latest')).toBe('sources/email/email-latest');
   });
 
   test('step 2: dir-hint construction', async () => {
@@ -548,6 +701,25 @@ describe('makeResolver — fallback chain', () => {
     );
     const r = makeResolver(engine);
     expect(await r.resolve('Brex Inc', 'companies')).toBe('companies/brex');
+  });
+
+  test('step 3.5: quickbooks invoice external ref prefers deal page', async () => {
+    const engine = makeFakeEngine(
+      ['deals/invoice-196-n329md', 'aircraft/n329md', 'jobs/2025-11-05-n329md-job-196'],
+      new Map(),
+      new Map([
+        ['quickbooks:invoice:1411', [
+          { slug: 'aircraft/n329md', type: 'aircraft' },
+          { slug: 'deals/invoice-196-n329md', type: 'deal' },
+          { slug: 'jobs/2025-11-05-n329md-job-196', type: 'job' },
+        ]],
+      ]),
+    );
+    const r = makeResolver(engine, { mode: 'batch' });
+    expect(await r.resolve('quickbooks:invoice:1411')).toBe('deals/invoice-196-n329md');
+    const counts = (engine as any)._counts();
+    expect(counts.executeRawCalls).toBe(1);
+    expect(counts.searchCalls).toBe(0);
   });
 
   test('batch mode NEVER calls searchKeyword (deterministic migration)', async () => {

@@ -13,6 +13,7 @@
  */
 
 import type { BrainEngine } from './engine.ts';
+import { slugifyPath } from './sync.ts';
 import type { PageType } from './types.ts';
 
 // ─── Entity references ──────────────────────────────────────────
@@ -419,8 +420,14 @@ export const FRONTMATTER_LINK_MAP: FrontmatterFieldMapping[] = [
   // Meeting pages
   { fields: ['attendees'], pageType: 'meeting', type: 'attended', direction: 'incoming', dirHint: 'people' },
   // Any page type
+  { fields: ['company_ref', 'company_refs'], type: 'related_to', direction: 'outgoing', dirHint: 'companies' },
+  { fields: ['contact_refs'], type: 'related_to', direction: 'outgoing', dirHint: 'people' },
+  { fields: ['aircraft_ref', 'aircraft_refs', 'fleet_refs'], type: 'related_to', direction: 'outgoing', dirHint: 'aircraft' },
+  { fields: ['airport_ref', 'airport_refs'], type: 'related_to', direction: 'outgoing', dirHint: 'airport' },
+  { fields: ['deal_refs'], type: 'related_to', direction: 'outgoing', dirHint: 'deals' },
+  { fields: ['job_refs'], type: 'related_to', direction: 'outgoing', dirHint: 'jobs' },
   { fields: ['sources'], type: 'discussed_in', direction: 'incoming', dirHint: ['source', 'media'] },
-  { fields: ['source'], type: 'source', direction: 'outgoing', dirHint: '' /* already slug-shaped */ },
+  { fields: ['source', 'source_refs'], type: 'source', direction: 'outgoing', dirHint: '' /* already slug-shaped */ },
   { fields: ['related', 'see_also'], type: 'related_to', direction: 'outgoing', dirHint: '' },
 ];
 
@@ -434,6 +441,76 @@ export interface SlugResolver {
    * extract/put_page summary so the user can see the gap.
    */
   resolve(name: string, dirHint?: string | string[]): Promise<string | null>;
+}
+
+function canonicalExternalSourceSlug(name: string): string | null {
+  if (typeof name !== 'string') return null;
+  const trimmed = name.trim();
+  if (!trimmed) return null;
+
+  if (trimmed.startsWith('quickbooks:')) {
+    const parts = trimmed.split(':');
+    if (parts.length >= 3) {
+      const kind = parts[1].replace(/_/g, '-').toLowerCase();
+      const id = parts.slice(2).join(':').trim();
+      if (kind && id) return `sources/quickbooks/${kind}/${id}`;
+    }
+  }
+
+  if (trimmed.startsWith('email-thread:')) {
+    const raw = trimmed.slice('email-thread:'.length);
+    return `sources/email-thread/${slugifyPath(raw)}`;
+  }
+
+  return null;
+}
+
+function externalRefDirPreference(name: string): string[] {
+  if (name.startsWith('quickbooks:invoice:')) {
+    return ['deals', 'finance-notifications', 'jobs', 'aircraft', 'companies'];
+  }
+  if (name.startsWith('quickbooks:project_customer:') || name.startsWith('quickbooks:customer:')) {
+    return ['companies', 'aircraft'];
+  }
+  return [];
+}
+
+async function resolveExactExternalRef(
+  engine: BrainEngine,
+  name: string,
+  hints: string[],
+): Promise<string | null> {
+  if (!name.includes(':')) return null;
+
+  const canonical = canonicalExternalSourceSlug(name);
+  if (canonical) {
+    const page = await engine.getPage(canonical);
+    if (page) return canonical;
+  }
+
+  const rows = await engine.executeRaw<{ slug?: string }>(
+    `SELECT slug
+       FROM pages
+      WHERE EXISTS (
+              SELECT 1
+                FROM jsonb_array_elements_text(COALESCE(frontmatter->'source_refs', '[]'::jsonb)) AS src(val)
+               WHERE src.val = $1
+            )
+         OR frontmatter->>'source_ref' = $1`,
+    [name],
+  );
+  const slugs = rows
+    .map(row => row.slug)
+    .filter((slug): slug is string => typeof slug === 'string' && slug.length > 0);
+  if (slugs.length === 0) return null;
+
+  const orderedHints = hints.length > 0 ? hints : externalRefDirPreference(name);
+  for (const hint of orderedHints) {
+    const match = slugs.find(slug => slug.startsWith(`${hint}/`));
+    if (match) return match;
+  }
+
+  return slugs.length === 1 ? slugs[0] : null;
 }
 
 /**
@@ -471,7 +548,7 @@ export function makeResolver(
       const hints = Array.isArray(dirHint) ? dirHint : (dirHint ? [dirHint] : []);
 
       // Step 1: already a slug? (dir/name shape, lowercase, hyphenated)
-      if (/^[a-z][a-z0-9-]*\/[a-z0-9][a-z0-9-]*$/.test(trimmed)) {
+      if (/^[a-z][a-z0-9-]*(?:\/[a-z0-9][a-z0-9-]*)+$/.test(trimmed)) {
         const page = await engine.getPage(trimmed);
         if (page) {
           cache.set(cacheKey, trimmed);
@@ -489,6 +566,16 @@ export function makeResolver(
           cache.set(cacheKey, candidate);
           return candidate;
         }
+      }
+
+      // Step 2.5: exact external source-ref lookup. First prefer a canonical
+      // source page slug if that page exists. Otherwise query by exact
+      // `source_refs` / `source_ref` frontmatter match and use dir preference
+      // to break ties for known external ref families like quickbooks:invoice:*.
+      const externalExact = await resolveExactExternalRef(engine, trimmed, hints);
+      if (externalExact) {
+        cache.set(cacheKey, externalExact);
+        return externalExact;
       }
 
       // Step 3: pg_trgm fuzzy title match — both modes. Tries each hint in
@@ -597,6 +684,7 @@ export async function extractFrontmatterLinks(
         // Outgoing: page → resolved. Incoming: resolved → page.
         const fromSlug = mapping.direction === 'outgoing' ? slug : resolved;
         const toSlug   = mapping.direction === 'outgoing' ? resolved : slug;
+        if (fromSlug === toSlug) continue;
         // Context enrichment (review Finding 7): readable in backlink panels
         // and search snippets instead of bare `frontmatter.key_people`.
         const context = `frontmatter.${field}: ${name}${contextExtra}`;
