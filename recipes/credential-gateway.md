@@ -28,6 +28,17 @@ health_checks:
       - type: env_exists
         name: GOOGLE_CLIENT_ID
         label: "Google OAuth"
+      - type: command
+        argv:
+          - python3
+          - -c
+          - |
+            import json, subprocess, sys
+            data = json.loads(subprocess.check_output(['gog', 'auth', 'list', '-j'], text=True))
+            accounts = data.get('accounts', [])
+            ok = any({'gmail', 'calendar'} & set(a.get('services', [])) for a in accounts)
+            sys.exit(0 if ok else 1)
+        label: "gog Gmail or Calendar auth"
 setup_time: 15 min
 cost_estimate: "$0 (both options are free)"
 ---
@@ -43,12 +54,15 @@ calendar-to-brain depend on.
 **You are the installer.** Other recipes depend on this one. If the user wants
 email-to-brain or calendar-to-brain, set up credential-gateway FIRST.
 
-**Two options, both free:**
+**Three options, all free:**
 - **Option A: ClawVisor** — handles OAuth, token refresh, and encryption for you.
   No token management. If you use multiple Google services, set up ClawVisor once
   and all recipes use it.
 - **Option B: Google OAuth directly** — no extra service, but you manage tokens
   yourself. Good if you don't want another dependency.
+- **Option C: gog CLI** — use an already-authenticated gog installation as the
+  Gmail and Calendar access layer. This is the practical Hermes path when local
+  automation already uses gog successfully.
 
 **Do not skip steps. Verify after each step.**
 
@@ -65,7 +79,12 @@ all use the same credentials. No token management on your end.
 
 **Option B: Google OAuth2 directly**
 Connect to Google APIs directly. No extra service. But you manage OAuth
-tokens yourself (they expire, need refresh)."
+tokens yourself (they expire, need refresh).
+
+**Option C: gog CLI**
+Use a gog installation that already has Gmail or Calendar auth working. This is
+ideal when Hermes or other local automations already rely on gog for Google
+Workspace access."
 
 #### Option A: ClawVisor Setup
 
@@ -141,11 +160,29 @@ Then run the OAuth flow:
 
 **STOP until OAuth credentials validate.**
 
+#### Option C: gog CLI Setup
+
+Tell the user:
+"If gog is already authenticated, we can use that instead of setting up another
+OAuth flow.
+
+Validate with live commands:
+
+```bash
+gog auth list -j
+gog gmail search 'in:inbox newer_than:1d' --max 1 -a <account> -j --no-input
+gog calendar events primary --from today --to tomorrow --max 1 -a <account> -j --no-input
+```
+
+If those commands work, the credential gateway is effectively satisfied through
+gog for that account. Record which gog account is active so downstream recipes
+know what mailbox and calendar to target."
+
 ### Step 2: Log Setup Completion
 
 ```bash
 mkdir -p ~/.gbrain/integrations/credential-gateway
-echo '{"ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","event":"setup_complete","source_version":"0.7.0","status":"ok","details":{"type":"CLAWVISOR_OR_GOOGLE"}}' >> ~/.gbrain/integrations/credential-gateway/heartbeat.jsonl
+echo '{"ts":"'$(date -u +%Y-%m-%dT%H:%M:%SZ)'","event":"setup_complete","source_version":"0.7.0","status":"ok","details":{"type":"CLAWVISOR_OR_GOOGLE_OR_GOG"}}' >> ~/.gbrain/integrations/credential-gateway/heartbeat.jsonl
 ```
 
 Tell the user: "Credential gateway is set up. Email-to-brain and calendar-to-brain
@@ -169,12 +206,17 @@ can now access your Google services."
    authorize each one separately in the OAuth flow. ClawVisor handles this
    automatically.
 
+5. **gog is a valid local auth layer.** If gog already has Gmail and Calendar
+   access working, do not force the user through another OAuth loop just to make
+   the recipe markdown happy.
+
 ## How to Verify
 
 1. **ClawVisor:** `curl $CLAWVISOR_URL/health` returns OK.
 2. **Google OAuth:** Tokens exist at `~/.gbrain/google-tokens.json`.
-3. **Gmail access:** Run the email collector — it should pull recent messages.
-4. **Calendar access:** Run the calendar sync — it should pull today's events.
+3. **gog:** `gog auth list -j` shows a Gmail or Calendar capable account.
+4. **Gmail access:** Run the email collector or a live `gog gmail search`.
+5. **Calendar access:** Run the calendar sync or a live `gog calendar events`.
 
 ## Cost Estimate
 

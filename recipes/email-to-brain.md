@@ -28,6 +28,17 @@ health_checks:
       - type: env_exists
         name: GOOGLE_CLIENT_ID
         label: "Google OAuth"
+      - type: command
+        argv:
+          - python3
+          - -c
+          - |
+            import json, subprocess, sys
+            data = json.loads(subprocess.check_output(['gog', 'auth', 'list', '-j'], text=True))
+            accounts = data.get('accounts', [])
+            ok = any('gmail' in a.get('services', []) for a in accounts)
+            sys.exit(0 if ok else 1)
+        label: "gog Gmail auth"
 setup_time: 20 min
 cost_estimate: "$0 (both options are free)"
 ---
