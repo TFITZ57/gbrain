@@ -17,24 +17,26 @@ shared context before doing anything else. External APIs only fill gaps.
 
 ```
 lookup(name_or_topic):
-  // STEP 1: Keyword search (fast, works day one, no embeddings needed)
-  results = gbrain search "{name_or_topic}"
-  if results.length > 0:
-    page = gbrain get {results[0].slug}
-    return page  // done, brain had it
+  // STEP 1: Direct canonical slug if the entity is obvious
+  // Examples: aircraft/n116fe, companies/alerion-aviation, deals/invoice-193-n116fe
+  for slug in guessed_canonical_slugs(name_or_topic):
+    page = gbrain get slug
+    if page: return page
 
-  // STEP 2: Hybrid search (needs embeddings, finds semantic matches)
-  results = gbrain query "what do we know about {name_or_topic}"
+  // STEP 2: Keyword search (fast, works day one, no embeddings needed)
+  results = gbrain search "{name_or_topic}" --limit 10
+  if results.length > 0:
+    pages = gbrain get top relevant slugs
+    return pages  // done, brain had it
+
+  // STEP 3: Hybrid search (needs embeddings, finds semantic matches)
+  results = gbrain query "what do we know about {name_or_topic}" --no-expand
   if results.length > 0:
     page = gbrain get {results[0].slug}
     return page
 
-  // STEP 3: Direct slug (if you know or can guess the slug)
-  page = gbrain get "people/{slugify(name_or_topic)}"
-  if page: return page
-
-  // STEP 4: External API (FALLBACK ONLY)
-  // Only reach here if brain has nothing
+  // STEP 4: External API / raw files (FALLBACK ONLY)
+  // Only reach here if brain has nothing, is stale, or lacks the needed attachment/form evidence.
   return external_search(name_or_topic)
 ```
 
