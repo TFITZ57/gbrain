@@ -153,6 +153,15 @@ describe('paramDefToSchema structural guard', () => {
     expect((eh.items as SchemaNode).type).toBe('string');
   });
 
+  test('update_fact.entity_hints declares items.type as string', () => {
+    const def = buildToolDefs(operations).find(d => d.name === 'update_fact');
+    expect(def).toBeDefined();
+    const eh = (def!.inputSchema.properties as Record<string, SchemaNode>).entity_hints;
+    expect(eh.type).toBe('array');
+    expect(eh.items).toBeDefined();
+    expect((eh.items as SchemaNode).type).toBe('string');
+  });
+
   test('paramDefToSchema recursively propagates nested items.items.type', () => {
     // Synthetic ParamDef: array-of-arrays-of-strings. No current op uses
     // this shape, so this test pins the contract for future ops and proves

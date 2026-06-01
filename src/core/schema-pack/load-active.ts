@@ -69,6 +69,29 @@ export type PackLocator = (name: string) => string | null;
 
 let _packLocator: PackLocator = defaultPackLocator;
 
+// v0.42 type-unification: one bundled-pack registry for every surface.
+// CLI list/show/validate/use, MCP list_schema_packs, and active-pack
+// resolution must agree. Keeping this list here prevents the bug class
+// where defaultPackLocator can load a pack that user-facing registries
+// do not expose.
+export const BUNDLED_SCHEMA_PACK_NAMES = [
+  'gbrain-base',
+  'gbrain-recommended',
+  'gbrain-creator',
+  'gbrain-investor',
+  'gbrain-engineer',
+  'gbrain-everything',
+  'gbrain-base-v2',
+] as const;
+
+export function listBundledSchemaPackNames(): string[] {
+  return [...BUNDLED_SCHEMA_PACK_NAMES];
+}
+
+export function locateSchemaPackFile(name: string): string | null {
+  return _packLocator(name);
+}
+
 /**
  * Replace the pack locator. Tests use this to inject synthetic packs
  * without writing to ~/.gbrain. Always pair with `_resetPackLocatorForTests`
@@ -92,28 +115,7 @@ export function _resetPackLocatorForTests(): void {
  * throwing UnknownPackError with a paste-ready install hint.
  */
 function defaultPackLocator(name: string): string | null {
-  // v0.39 T8 — bundled packs registry. gbrain-base + gbrain-recommended
-  // ship in src/core/schema-pack/base/. Add a new entry here to bundle
-  // additional canonical packs.
-  //
-  // v0.41 T4 — lens packs join the bundle: creator (atoms + concepts +
-  // extract_atoms/synthesize_concepts phases), investor (theses + bet
-  // resolution + 3 calibration domains), engineer (gstack-learnings bridge
-  // + 3 calibration domains), everything (meta-pack stacking all three
-  // via extends + borrow_from). Each ships as a real YAML at base/<name>.yaml.
-  const BUNDLED: ReadonlyArray<string> = [
-    'gbrain-base',
-    'gbrain-recommended',
-    'gbrain-creator',
-    'gbrain-investor',
-    'gbrain-engineer',
-    'gbrain-everything',
-    // v0.42 type-unification: 15-type canonical successor to gbrain-base.
-    // Ships as install default (Lane E T17) + via gbrain onboard pack
-    // upgrade flow (the unify-types Minion handler).
-    'gbrain-base-v2',
-  ];
-  if (BUNDLED.includes(name)) {
+  if ((BUNDLED_SCHEMA_PACK_NAMES as readonly string[]).includes(name)) {
     // Resolve bundled YAML relative to this source file. Works in both
     // direct-bun execution and bun --compile binaries.
     const here = dirname(fileURLToPath(import.meta.url));

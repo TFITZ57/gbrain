@@ -44,7 +44,7 @@ export async function getBrainHotMemoryMeta(
   // Don't inject on tool calls that themselves manipulate hot memory —
   // the agent doesn't need the brain's hot memory wrapped around its own
   // recall response.
-  if (name === 'recall' || name === 'extract_facts' || name === 'forget_fact') return undefined;
+  if (name === 'recall' || name === 'extract_facts' || name === 'update_fact' || name === 'forget_fact') return undefined;
 
   const sourceId = ctx.sourceId ?? 'default';
   const sessionId = (ctx as { source_session?: string }).source_session

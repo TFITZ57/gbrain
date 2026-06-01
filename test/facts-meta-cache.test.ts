@@ -134,9 +134,10 @@ describe('meta-hook cache', () => {
     expect(b2Count).toBe(b1Count);
   });
 
-  test('skipped on facts-self ops (recall, extract_facts, forget_fact)', async () => {
+  test('skipped on facts-self ops (recall, extract_facts, update_fact, forget_fact)', async () => {
     expect(await getBrainHotMemoryMeta('recall', ctx())).toBeUndefined();
     expect(await getBrainHotMemoryMeta('extract_facts', ctx())).toBeUndefined();
+    expect(await getBrainHotMemoryMeta('update_fact', ctx())).toBeUndefined();
     expect(await getBrainHotMemoryMeta('forget_fact', ctx())).toBeUndefined();
   });
 

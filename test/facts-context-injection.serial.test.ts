@@ -81,10 +81,17 @@ describe('_meta injection on dispatch', () => {
     expect(facts.find(f => f.fact === 'world fact')).toBeDefined();
   });
 
-  test('skipped on facts ops themselves (recall, extract_facts, forget_fact)', async () => {
-    for (const opName of ['recall', 'extract_facts', 'forget_fact']) {
+  test('skipped on facts ops themselves (recall, extract_facts, update_fact, forget_fact)', async () => {
+    for (const opName of ['recall', 'extract_facts', 'update_fact', 'forget_fact']) {
       __resetHotMemoryCacheForTests();
-      const r = await dispatchToolCall(engine, opName, opName === 'forget_fact' ? { id: 1 } : opName === 'extract_facts' ? { turn_text: 'x' } : {}, {
+      const params = opName === 'forget_fact'
+        ? { id: 1 }
+        : opName === 'update_fact'
+          ? { id: 1, fact: 'replacement' }
+          : opName === 'extract_facts'
+            ? { turn_text: 'x' }
+            : {};
+      const r = await dispatchToolCall(engine, opName, params, {
         remote: false,
         sourceId: 'default',
         metaHook: getBrainHotMemoryMeta,

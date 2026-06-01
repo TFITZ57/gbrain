@@ -6,7 +6,7 @@
  */
 
 import { describe, test, expect } from 'bun:test';
-import { formatRecipeTable, envReady } from '../src/commands/providers.ts';
+import { formatRecipeTable, envReady, providerEnvWithConfig } from '../src/commands/providers.ts';
 import { listRecipes, getRecipe } from '../src/core/ai/recipes/index.ts';
 import type { Recipe } from '../src/core/ai/types.ts';
 
@@ -32,6 +32,22 @@ describe('envReady', () => {
     const ollama = getRecipe('ollama');
     expect(ollama).toBeDefined();
     expect(envReady(ollama!, {})).toBe(true);
+  });
+});
+
+describe('providerEnvWithConfig', () => {
+  test('maps config-file OpenAI key to provider env', () => {
+    const env = providerEnvWithConfig({ openai_api_key: 'sk-file' }, {});
+    expect(env.OPENAI_API_KEY).toBe('sk-file');
+  });
+
+  test('process env wins over config-file keys', () => {
+    const env = providerEnvWithConfig(
+      { openai_api_key: 'sk-file', anthropic_api_key: 'anthropic-file' },
+      { OPENAI_API_KEY: 'sk-env' },
+    );
+    expect(env.OPENAI_API_KEY).toBe('sk-env');
+    expect(env.ANTHROPIC_API_KEY).toBe('anthropic-file');
   });
 });
 

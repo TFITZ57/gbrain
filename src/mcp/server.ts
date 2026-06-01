@@ -5,8 +5,58 @@ import type { BrainEngine } from '../core/engine.ts';
 import { operations } from '../core/operations.ts';
 import { VERSION } from '../version.ts';
 import { buildToolDefs } from './tool-defs.ts';
-import { dispatchToolCall, validateParams, buildOperationContext } from './dispatch.ts';
+import { dispatchToolCall, validateParams, buildOperationContext, summarizeMcpParams } from './dispatch.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
+import { executeRawJsonb } from '../core/sql-query.ts';
+
+export interface StdioMcpLogEvent {
+  operation: string;
+  status: 'success' | 'error';
+  latencyMs: number;
+  toolName?: string;
+  params?: unknown;
+  errorMessage?: string | null;
+  agentName?: string;
+}
+
+function stdioAgentName(): string {
+  return process.env.GBRAIN_AGENT_NAME || 'stdio';
+}
+
+function extractToolErrorMessage(result: { content?: { text?: string }[]; isError?: boolean }): string | null {
+  if (!result.isError) return null;
+  const text = result.content?.[0]?.text ?? '';
+  if (!text) return 'unknown_error';
+  try {
+    const parsed = JSON.parse(text);
+    return parsed.error?.message ?? parsed.message ?? parsed.error ?? 'unknown_error';
+  } catch {
+    return text.slice(0, 500);
+  }
+}
+
+export async function logStdioMcpRequest(
+  engine: BrainEngine,
+  event: StdioMcpLogEvent,
+): Promise<void> {
+  const paramsSummary = event.toolName
+    ? summarizeMcpParams(event.toolName, event.params)
+    : null;
+  await executeRawJsonb(
+    engine,
+    `INSERT INTO mcp_request_log (token_name, agent_name, operation, latency_ms, status, error_message, params)
+     VALUES ($1, $2, $3, $4, $5, $6, $7::jsonb)`,
+    [
+      'stdio',
+      event.agentName || stdioAgentName(),
+      event.operation,
+      event.latencyMs,
+      event.status,
+      event.errorMessage || null,
+    ],
+    [paramsSummary],
+  );
+}
 
 export async function startMcpServer(engine: BrainEngine) {
   const server = new Server(
@@ -17,9 +67,18 @@ export async function startMcpServer(engine: BrainEngine) {
   // Generate tool definitions from operations. Extracted to buildToolDefs so
   // the subagent tool registry (v0.15+) can call the same mapper against a
   // filtered OPERATIONS subset instead of duplicating this shape.
-  server.setRequestHandler(ListToolsRequestSchema, async () => ({
-    tools: buildToolDefs(operations),
-  }));
+  server.setRequestHandler(ListToolsRequestSchema, async () => {
+    const startedMs = Date.now();
+    const response = { tools: buildToolDefs(operations) };
+    try {
+      await logStdioMcpRequest(engine, {
+        operation: 'tools/list',
+        status: 'success',
+        latencyMs: Date.now() - startedMs,
+      });
+    } catch { /* best effort */ }
+    return response;
+  });
 
   // Dispatch tool calls via shared dispatch.ts (parity with HTTP transport).
   // MCP stdio callers are remote/untrusted; dispatch defaults remote=true.
@@ -27,13 +86,14 @@ export async function startMcpServer(engine: BrainEngine) {
   // gbrain ops are synchronous, so we return the legacy `{ content, isError? }`
   // shape and cast through `any` (the SDK accepts it via the ServerResult union).
   server.setRequestHandler(CallToolRequestSchema, async (request: any): Promise<any> => {
+    const startedMs = Date.now();
     const { name, arguments: params } = request.params;
     // v0.28: stdio MCP has no per-token auth (local pipe). Default the
     // takes-holder allow-list to ['world'] so agent-facing callers don't
     // see private hunches via takes_list / takes_search / query. Operators
     // who want stdio to see everything should call ops directly via
     // `gbrain call <op>` (sets remote=false in src/cli.ts).
-    return dispatchToolCall(engine, name, params, {
+    const result = await dispatchToolCall(engine, name, params, {
       remote: true,
       takesHoldersAllowList: ['world'],
       // v0.31: source defaults to 'default' for stdio (no per-token scope).
@@ -45,6 +105,17 @@ export async function startMcpServer(engine: BrainEngine) {
       // every tool-call response. Best-effort; absorbs errors.
       metaHook: getBrainHotMemoryMeta,
     });
+    try {
+      await logStdioMcpRequest(engine, {
+        operation: `tools/call:${name}`,
+        toolName: name,
+        params,
+        status: result.isError ? 'error' : 'success',
+        errorMessage: extractToolErrorMessage(result),
+        latencyMs: Date.now() - startedMs,
+      });
+    } catch { /* best effort */ }
+    return result;
   });
 
   const transport = new StdioServerTransport();

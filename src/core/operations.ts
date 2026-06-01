@@ -3453,6 +3453,11 @@ const extract_facts: Operation = {
       return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped: 'dream_generated' };
     }
 
+    const { isAvailable } = await import('./ai/gateway.ts');
+    if (!isAvailable('chat')) {
+      return { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped: 'chat_unavailable' };
+    }
+
     const sourceId = ctx.sourceId ?? 'default';
     const visibility: 'private' | 'world' = p.visibility === 'world' ? 'world' : 'private';
 
@@ -3610,6 +3615,79 @@ const forget_fact: Operation = {
       throw new OperationError('fact_already_expired', `Fact id ${id} already expired.`);
     }
     return { id, expired: true, path: result.path, reason: result.reason };
+  },
+};
+
+const update_fact: Operation = {
+  name: 'update_fact',
+  description: 'v0.42: replace a durable hot-memory fact. Expires the old fact through the same fence-aware path as forget_fact, then captures the replacement through the extract_facts pipeline so entity resolution, dedup, visibility, and session provenance stay consistent.',
+  params: {
+    id: { type: 'number', required: true, description: 'Existing fact id to supersede.' },
+    fact: { type: 'string', required: true, description: 'Replacement fact text to extract and store.' },
+    reason: { type: 'string', required: false, description: 'Reason written to the expired row. Default: "superseded".' },
+    session_id: { type: 'string', description: 'Opaque session id stored on each replacement fact.' },
+    entity_hints: { type: 'array', items: { type: 'string' }, description: 'Existing canonical entity slugs the agent has already resolved.' },
+    visibility: { type: 'string', description: 'Replacement fact visibility. private (default) | world.' },
+  },
+  mutating: true,
+  scope: 'write',
+  handler: async (ctx, p) => {
+    if (ctx.dryRun) return { dry_run: true, action: 'update_fact', id: p.id };
+
+    const id = p.id as number;
+    const fact = typeof p.fact === 'string' ? p.fact.trim() : '';
+    if (!fact) {
+      throw new OperationError('invalid_params', 'Replacement fact text is required.');
+    }
+
+    const reason = typeof p.reason === 'string' && p.reason.trim()
+      ? p.reason.trim()
+      : 'superseded';
+    const { forgetFactInFence } = await import('./facts/forget.ts');
+    const forgot = await forgetFactInFence(ctx.engine, id, { reason });
+    if (!forgot.ok && forgot.path === 'not_found') {
+      throw new OperationError('fact_not_found', `Fact id ${id} not found.`);
+    }
+    if (!forgot.ok && forgot.path === 'already_expired') {
+      throw new OperationError('fact_already_expired', `Fact id ${id} already expired.`);
+    }
+
+    const { isFactsExtractionEnabled } = await import('./facts/extract.ts');
+    if (!(await isFactsExtractionEnabled(ctx.engine))) {
+      return {
+        old_fact_id: id,
+        expired: true,
+        path: forgot.path,
+        reason: forgot.reason,
+        replacement: { inserted: 0, duplicate: 0, superseded: 0, fact_ids: [], skipped: 'extraction_disabled' },
+      };
+    }
+
+    const { runFactsPipeline } = await import('./facts/backstop.ts');
+    const sourceId = ctx.sourceId ?? 'default';
+    const visibility: 'private' | 'world' = p.visibility === 'world' ? 'world' : 'private';
+    const replacement = await runFactsPipeline(fact, {
+      engine: ctx.engine,
+      sourceId,
+      sessionId: typeof p.session_id === 'string' ? p.session_id : null,
+      entityHints: Array.isArray(p.entity_hints) ? (p.entity_hints as string[]) : undefined,
+      source: 'mcp:update_fact',
+      visibility,
+      mode: 'inline',
+    });
+
+    return {
+      old_fact_id: id,
+      expired: true,
+      path: forgot.path,
+      reason: forgot.reason,
+      replacement: {
+        inserted: replacement.inserted,
+        duplicate: replacement.duplicate,
+        superseded: replacement.superseded,
+        fact_ids: replacement.fact_ids,
+      },
+    };
   },
 };
 
@@ -4052,7 +4130,8 @@ const list_schema_packs: Operation = {
     const { existsSync, readdirSync } = await import('node:fs');
     const { join } = await import('node:path');
     const { gbrainPath } = await import('./config.ts');
-    const bundled = ['gbrain-base', 'gbrain-recommended'];
+    const { listBundledSchemaPackNames } = await import('./schema-pack/load-active.ts');
+    const bundled = listBundledSchemaPackNames();
     const installedDir = gbrainPath('schema-packs');
     const installed: string[] = [];
     if (existsSync(installedDir)) {
@@ -4509,7 +4588,7 @@ export const operations: Operation[] = [
   // v0.29: Salience + anomalies + recent transcripts
   get_recent_salience, find_anomalies, get_recent_transcripts,
   // v0.31: hot memory (facts table)
-  extract_facts, recall, forget_fact,
+  extract_facts, recall, update_fact, forget_fact,
   // v0.32.6: contradiction probe MCP surface (M3)
   find_contradictions,
   // v0.33: expertise + relationship-proximity routing

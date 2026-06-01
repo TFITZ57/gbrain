@@ -3615,7 +3615,7 @@ export async function buildChecks(
   // triage the misses interactively.
   if (engine) {
     try {
-      const { parseConversation } = await import('../core/conversation-parser/parse.ts');
+      const { isNoTranscriptCallLog, parseConversation } = await import('../core/conversation-parser/parse.ts');
       const allowedTypes = ['conversation', 'meeting', 'slack', 'email'] as const;
       // PageFilters supports singular `type` only; iterate the 4 types
       // and cap at ~50/each to land at ~200 total max.
@@ -3633,14 +3633,21 @@ export async function buildChecks(
       } else {
         const hitsByPattern: Record<string, number> = {};
         let unmatched = 0;
+        let skippedNoTranscriptCallLogs = 0;
+        let considered = 0;
         for (const page of sample) {
           const body = `${page.compiled_truth ?? ''}\n${page.timeline ?? ''}`.trim();
+          if (isNoTranscriptCallLog(body, page)) {
+            skippedNoTranscriptCallLogs++;
+            continue;
+          }
+          considered++;
           const result = parseConversation(body, { page, noPolish: true, noFallback: true });
           const id = result.matched_pattern_id ?? '_no_match';
           hitsByPattern[id] = (hitsByPattern[id] ?? 0) + 1;
           if (result.phase === 'no_match') unmatched++;
         }
-        const unmatchedPct = (unmatched / sample.length) * 100;
+        const unmatchedPct = considered > 0 ? (unmatched / considered) * 100 : 0;
         const breakdown = Object.entries(hitsByPattern)
           .sort(([, a], [, b]) => b - a)
           .map(([k, v]) => `${k}=${v}`)
@@ -3650,7 +3657,8 @@ export async function buildChecks(
             name: 'conversation_format_coverage',
             status: 'warn',
             message:
-              `${unmatched}/${sample.length} conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern. ` +
+              `${unmatched}/${considered} conversation pages (${unmatchedPct.toFixed(1)}%) match NO built-in pattern` +
+              (skippedNoTranscriptCallLogs > 0 ? ` (${skippedNoTranscriptCallLogs} no-transcript call logs excluded). ` : '. ') +
               `Breakdown: ${breakdown}. ` +
               `Investigate: gbrain conversation-parser scan <slug> | ` +
               `Enable LLM fallback (opt-in): gbrain config set conversation_parser.llm_fallback_enabled true`,
@@ -3659,7 +3667,9 @@ export async function buildChecks(
           checks.push({
             name: 'conversation_format_coverage',
             status: 'ok',
-            message: `${sample.length} pages: ${breakdown}`,
+            message:
+              `${considered} pages: ${breakdown || 'no parser-eligible pages'}` +
+              (skippedNoTranscriptCallLogs > 0 ? `; ${skippedNoTranscriptCallLogs} no-transcript call logs excluded` : ''),
           });
         }
       }

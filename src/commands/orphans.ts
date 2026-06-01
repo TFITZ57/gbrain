@@ -52,6 +52,17 @@ const DENY_PREFIXES = [
   'openclaw/config/',
 ];
 
+/** Generated domains whose pages should not inflate orphan scoring. */
+const GENERATED_ORPHAN_DOMAINS = new Set(['source', 'flight-alert-bundle']);
+
+/** Generated slug families whose pages should not inflate orphan scoring. */
+const GENERATED_ORPHAN_PREFIXES = [
+  'sources/',
+  'source/',
+  'flight-alert-bundle/',
+  'flight-alert-bundles/',
+];
+
 /** First slug segments where no inbound links is expected */
 const FIRST_SEGMENT_EXCLUSIONS = new Set(['scratch', 'thoughts', 'catalog', 'entities']);
 
@@ -83,6 +94,19 @@ export function shouldExclude(slug: string): boolean {
   if (FIRST_SEGMENT_EXCLUSIONS.has(firstSegment)) return true;
 
   return false;
+}
+
+export function shouldExcludeGeneratedDomain(
+  domain: string | null | undefined,
+  slug: string,
+): boolean {
+  const normalizedDomain = typeof domain === 'string' ? domain.trim() : '';
+  if (GENERATED_ORPHAN_DOMAINS.has(normalizedDomain)) return true;
+  return GENERATED_ORPHAN_PREFIXES.some((prefix) => slug.startsWith(prefix));
+}
+
+function shouldExcludeCandidate(row: { slug: string; domain?: string | null }): boolean {
+  return shouldExclude(row.slug) || shouldExcludeGeneratedDomain(row.domain, row.slug);
 }
 
 /**
@@ -169,14 +193,14 @@ export async function findOrphans(
       liveParams.push(sourceId);
       scopeClause = ` AND source_id = $${liveParams.length}`;
     }
-    const liveRows = await engine.executeRaw<{ slug: string }>(
-      `SELECT slug FROM pages WHERE deleted_at IS NULL${scopeClause}`,
+    const liveRows = await engine.executeRaw<{ slug: string; domain: string | null }>(
+      `SELECT slug, frontmatter->>'domain' AS domain FROM pages WHERE deleted_at IS NULL${scopeClause}`,
       liveParams,
     );
     total = liveRows.length;
     excludedAll = includePseudo
       ? 0
-      : liveRows.reduce((n, r) => n + (shouldExclude(r.slug) ? 1 : 0), 0);
+      : liveRows.reduce((n, r) => n + (shouldExcludeCandidate(r) ? 1 : 0), 0);
   } finally {
     stopHb();
     progress.finish();
@@ -184,7 +208,7 @@ export async function findOrphans(
 
   const filtered = includePseudo
     ? allOrphans
-    : allOrphans.filter(row => !shouldExclude(row.slug));
+    : allOrphans.filter(row => !shouldExcludeCandidate(row));
 
   const orphans: OrphanPage[] = filtered.map(row => ({
     slug: row.slug,

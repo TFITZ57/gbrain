@@ -20,6 +20,7 @@ import { describe, expect, test } from 'bun:test';
 import {
   parseConversation,
   deriveDateContext,
+  isNoTranscriptCallLog,
   applyPattern,
   scorePattern,
   scorePatternFull,
@@ -304,6 +305,35 @@ describe('parseConversation — degenerate inputs', () => {
     const r = parseConversation('This is just prose with no chat shape.');
     expect(r.phase).toBe('no_match');
     expect(r.messages).toHaveLength(0);
+  });
+});
+
+describe('isNoTranscriptCallLog', () => {
+  test('detects Twilio-style call logs with no transcript', () => {
+    const body = [
+      '# Call Log',
+      'Call SID: CA123',
+      'From: +12035550100',
+      'To: +12035550101',
+      'Direction: inbound',
+      'Status: completed',
+      'Duration: 34 seconds',
+      'Transcript unavailable',
+    ].join('\n');
+    expect(isNoTranscriptCallLog(body, makePage({}, undefined))).toBe(true);
+  });
+
+  test('does not exclude call pages that contain a transcript section', () => {
+    const body = [
+      '# Voice Call',
+      'From: +12035550100',
+      'To: +12035550101',
+      'Duration: 34 seconds',
+      '## Transcript',
+      '**Alice:** hello',
+      '**Bob:** hi',
+    ].join('\n');
+    expect(isNoTranscriptCallLog(body, makePage({}, undefined))).toBe(false);
   });
 });
 
