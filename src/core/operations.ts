@@ -610,6 +610,7 @@ const put_page: Operation = {
     source_kind: { type: 'string', required: false, description: 'Ingestion channel taxonomy (capture-cli | put_page | webhook | …). Remote callers: SERVER-STAMPED, client value ignored.' },
     source_uri: { type: 'string', required: false, description: 'Original URI/path/message-id the event carried. Remote callers: SERVER-STAMPED null.' },
     ingested_via: { type: 'string', required: false, description: 'Richer label paired with source_kind. Remote callers: SERVER-STAMPED.' },
+    facts_mode: { type: 'string', required: false, description: 'Facts backstop mode: queue (default), inline, or skip. Capture uses inline for an honest receipt; bulk writes should keep queue mode.' },
   },
   mutating: true,
   scope: 'write',
@@ -863,45 +864,86 @@ const put_page: Operation = {
     // on a conversation-shape slug AND the body has substantive prose, fire
     // a fact-extraction job into the bounded queue. Skipped on dry-run,
     // dream-generated content (anti-loop), and non-eligible kinds (sync,
-    // ingest, file uploads, code pages). Never blocks the put_page response.
+    // ingest, file uploads, code pages).
     // v0.31.2: routed through runFactsBackstop (PR1 commit 6) so put_page
     // and sync share the same eligibility/extract/dedup/insert pipeline.
     // Queue mode preserves the prior fire-and-forget shape (caller's
     // put_page response stays fast). Default 'all' notability filter
     // (MEDIUM facts wait for the dream cycle but DO land via put_page,
     // matching the pre-fix behavior on this surface).
-    let factsQueued: { queued: boolean } | { skipped: string } | undefined;
+    // v0.43 capture hardening: trusted capture can request inline mode so
+    // the CLI receipt is honest about whether fact absorption actually ran.
+    type FactsBackstopReceipt =
+      | { queued: boolean }
+      | { skipped: string }
+      | {
+          mode: 'inline';
+          inserted: number;
+          duplicate: number;
+          superseded: number;
+          fact_ids: number[];
+        };
+    const rawFactsMode = typeof p.facts_mode === 'string' ? p.facts_mode : undefined;
+    const factsMode: 'queue' | 'inline' | 'skip' =
+      rawFactsMode === 'inline' || rawFactsMode === 'skip' ? rawFactsMode : 'queue';
+    let factsBackstop: FactsBackstopReceipt | undefined;
     try {
-      const { runFactsBackstop } = await import('./facts/backstop.ts');
-      const r = await runFactsBackstop(
-        {
-          slug,
-          type: result.parsedPage!.type,
-          compiled_truth: result.parsedPage!.compiled_truth,
-          frontmatter: result.parsedPage!.frontmatter,
-        },
-        {
-          engine: ctx.engine,
-          sourceId: ctx.sourceId ?? 'default',
-          sessionId: (ctx as { source_session?: string }).source_session ?? null,
-          source: 'mcp:put_page',
-          mode: 'queue',
-        },
-      );
-      if (r.mode === 'queue' && r.enqueued) {
-        factsQueued = { queued: true };
-      } else if (r.mode === 'queue' && r.skipped) {
-        // Preserve the pre-v0.31.2 response shape for MCP clients:
-        // 'kind:guide' / 'too_short' / 'subagent_namespace' / 'dream_generated'
-        // (bare reasons), not the helper's namespaced 'eligibility_failed:...'
-        // discriminator. Map back here.
-        const bare = r.skipped.startsWith('eligibility_failed:')
-          ? r.skipped.slice('eligibility_failed:'.length)
-          : r.skipped;
-        factsQueued = { skipped: bare };
+      if (factsMode === 'skip') {
+        factsBackstop = { skipped: 'facts_mode_skip' };
+      } else {
+        const { runFactsBackstop } = await import('./facts/backstop.ts');
+        const sessionId = (ctx as { source_session?: string }).source_session ?? slug;
+        const r = await runFactsBackstop(
+          {
+            slug,
+            type: result.parsedPage!.type,
+            compiled_truth: result.parsedPage!.compiled_truth,
+            frontmatter: result.parsedPage!.frontmatter,
+          },
+          {
+            engine: ctx.engine,
+            sourceId: ctx.sourceId ?? 'default',
+            sessionId,
+            source: 'mcp:put_page',
+            mode: factsMode,
+          },
+        );
+        if (r.mode === 'queue' && r.enqueued) {
+          factsBackstop = { queued: true };
+        } else if (r.mode === 'queue' && r.skipped) {
+          // Preserve the pre-v0.31.2 response shape for MCP clients:
+          // 'kind:guide' / 'too_short' / 'subagent_namespace' / 'dream_generated'
+          // (bare reasons), not the helper's namespaced 'eligibility_failed:...'
+          // discriminator. Map back here.
+          const bare = r.skipped.startsWith('eligibility_failed:')
+            ? r.skipped.slice('eligibility_failed:'.length)
+            : r.skipped;
+          factsBackstop = { skipped: bare };
+        } else if (r.mode === 'inline') {
+          if (r.skipped) {
+            const bare = r.skipped.startsWith('eligibility_failed:')
+              ? r.skipped.slice('eligibility_failed:'.length)
+              : r.skipped;
+            factsBackstop = { skipped: bare };
+          } else {
+            factsBackstop = {
+              mode: 'inline',
+              inserted: r.inserted,
+              duplicate: r.duplicate,
+              superseded: r.superseded,
+              fact_ids: r.fact_ids,
+            };
+          }
+        }
       }
-    } catch {
-      factsQueued = { skipped: 'backstop_error' };
+    } catch (err) {
+      if (factsMode === 'inline') {
+        throw new OperationError(
+          'extraction_failed',
+          `facts backstop failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+      factsBackstop = { skipped: 'backstop_error' };
     }
 
     // Post-write validator lint (PR 2.5): feature-flag-gated, non-blocking.
@@ -932,7 +974,7 @@ const put_page: Operation = {
       ...(autoLinks ? { auto_links: autoLinks } : {}),
       ...(autoTimeline ? { auto_timeline: autoTimeline } : {}),
       ...(writerLint ? { writer_lint: writerLint } : {}),
-      ...(factsQueued ? { facts_backstop: factsQueued } : {}),
+      ...(factsBackstop ? { facts_backstop: factsBackstop } : {}),
       ...(writeThrough ? { write_through: writeThrough } : {}),
     };
   },

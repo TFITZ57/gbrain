@@ -8,11 +8,12 @@
  * gets the same write-through plumbing).
  */
 
-import { afterAll, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
+import { afterAll, afterEach, beforeAll, beforeEach, describe, expect, test } from 'bun:test';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import * as os from 'node:os';
 import { PGLiteEngine } from '../../src/core/pglite-engine.ts';
+import { __setChatTransportForTests, resetGateway, type ChatResult } from '../../src/core/ai/gateway.ts';
 import { resetPgliteState } from '../helpers/reset-pglite.ts';
 import matter from 'gray-matter';
 import { runCapture, __testing } from '../../src/commands/capture.ts';
@@ -20,6 +21,35 @@ import { runCapture, __testing } from '../../src/commands/capture.ts';
 let engine: PGLiteEngine;
 let tmpRoot: string;
 let brainDir: string;
+
+function stubFactExtraction(factText: string) {
+  __setChatTransportForTests(async (): Promise<ChatResult> => ({
+    text: JSON.stringify({
+      facts: [
+        {
+          fact: factText,
+          kind: 'fact',
+          notability: 'medium',
+          entity: null,
+          effective_at: null,
+          valid_until: null,
+          confidence: 0.9,
+          source_quote: null,
+        },
+      ],
+    }),
+    blocks: [],
+    stopReason: 'end',
+    usage: {
+      input_tokens: 0,
+      output_tokens: 0,
+      cache_read_tokens: 0,
+      cache_creation_tokens: 0,
+    },
+    model: 'test:stub',
+    providerId: 'test',
+  }));
+}
 
 beforeAll(async () => {
   engine = new PGLiteEngine();
@@ -37,6 +67,13 @@ beforeEach(async () => {
   brainDir = path.join(tmpRoot, 'brain');
   fs.mkdirSync(brainDir, { recursive: true });
   await engine.setConfig('sync.repo_path', brainDir);
+  __setChatTransportForTests(null);
+  resetGateway();
+});
+
+afterEach(() => {
+  __setChatTransportForTests(null);
+  resetGateway();
 });
 
 describe('capture — defaultSlug helper', () => {
@@ -220,6 +257,45 @@ describe('capture — local install integration', () => {
     expect(json.slug).toBe('inbox/json-out');
     expect(json.content_hash).toMatch(/^[a-f0-9]{64}$/);
     expect(json.captured_at).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+  });
+
+  test('local capture waits for inline fact absorption and reports the receipt', async () => {
+    stubFactExtraction('Webhook provider route cleanup retired HubSpot and fixed the remaining provider routes.');
+
+    const logCaptured: string[] = [];
+    const origLog = console.log;
+    console.log = (...args: unknown[]) => logCaptured.push(args.map(String).join(' '));
+    try {
+      await runCapture(engine, [
+        '--json',
+        '--slug',
+        'sources/webhook-hub/inline-capture-test',
+        [
+          'Webhook provider route cleanup finished on 2026-06-11.',
+          'HubSpot webhook subscriptions were removed at the source.',
+          'Unipile and the other provider routes should continue absorbing provider events through Hermes.',
+        ].join(' '),
+      ]);
+    } finally {
+      console.log = origLog;
+    }
+
+    const receipt = JSON.parse(logCaptured.join('\n'));
+    expect(receipt.facts_backstop).toMatchObject({
+      mode: 'inline',
+      inserted: 1,
+      duplicate: 0,
+      superseded: 0,
+    });
+    expect(receipt.facts_backstop.fact_ids).toHaveLength(1);
+
+    const rows = (await engine.executeRaw(
+      `select count(*)::text as count
+         from facts
+        where source = 'mcp:put_page'
+          and source_session = 'sources/webhook-hub/inline-capture-test'`,
+    )) as Array<{ count: string }>;
+    expect(rows[0]?.count).toBe('1');
   });
 });
 
