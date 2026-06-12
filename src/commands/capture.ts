@@ -314,6 +314,16 @@ interface CaptureResult {
   path?: string;
   source_kind: string;
   captured_at: string;
+  facts_backstop?:
+    | { queued: boolean }
+    | { skipped: string }
+    | {
+        mode: 'inline';
+        inserted: number;
+        duplicate: number;
+        superseded: number;
+        fact_ids: number[];
+      };
 }
 
 function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): void {
@@ -331,6 +341,17 @@ function printReceipt(result: CaptureResult, quiet: boolean, json: boolean): voi
   console.log(`  content_hash:  ${result.content_hash.slice(0, 16)}…`);
   if (result.path) {
     console.log(`  file:          ${result.path}`);
+  }
+  if (result.facts_backstop) {
+    if ('mode' in result.facts_backstop && result.facts_backstop.mode === 'inline') {
+      console.log(
+        `  facts:         inserted=${result.facts_backstop.inserted} duplicate=${result.facts_backstop.duplicate} superseded=${result.facts_backstop.superseded}`,
+      );
+    } else if ('skipped' in result.facts_backstop) {
+      console.log(`  facts:         skipped (${result.facts_backstop.skipped})`);
+    } else if ('queued' in result.facts_backstop) {
+      console.log(`  facts:         queued=${String(result.facts_backstop.queued)}`);
+    }
   }
   console.log(`  captured_at:   ${result.captured_at}`);
 }
@@ -456,7 +477,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       raw = await callRemoteTool(
         cfg!,
         'put_page',
-        { slug, content: fullContent },
+        { slug, content: fullContent, facts_mode: 'inline' },
         { timeoutMs: 30_000 },
       );
     } catch (e) {
@@ -482,6 +503,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       status?: string;
       chunks?: number;
       write_through?: { written: boolean; path?: string };
+      facts_backstop?: CaptureResult['facts_backstop'];
     }>(raw);
     const result: CaptureResult = {
       slug: remoteResult.slug,
@@ -490,6 +512,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       content_hash: contentHash,
       written: remoteResult.write_through?.written ?? false,
       path: remoteResult.write_through?.path,
+      facts_backstop: remoteResult.facts_backstop,
       // CV3: source_kind ALWAYS 'capture-cli' for capture invocations,
       // regardless of --source. --source maps to source_id (the DB FK),
       // not the ingestion-channel taxonomy. Conflating these was the
@@ -543,11 +566,13 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
       source_kind: 'capture-cli',
       source_uri: sourceUri,
       ingested_via: 'capture-cli',
+      facts_mode: 'inline',
     })) as {
       slug: string;
       status?: string;
       chunks?: number;
       write_through?: { written: boolean; path?: string; skipped?: string };
+      facts_backstop?: CaptureResult['facts_backstop'];
     };
     printReceipt(
       {
@@ -557,6 +582,7 @@ export async function runCapture(engine: BrainEngine | null, args: string[]): Pr
         content_hash: contentHash,
         written: result.write_through?.written ?? false,
         path: result.write_through?.path,
+        facts_backstop: result.facts_backstop,
         // CV3: source_kind is the channel taxonomy, NOT the DB source FK.
         source_kind: 'capture-cli',
         captured_at: capturedAt,

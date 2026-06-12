@@ -20,6 +20,7 @@ import {
   findOrphans,
   getOrphansData,
   shouldExclude,
+  shouldExcludeGeneratedDomain,
   runOrphans,
 } from '../src/commands/orphans.ts';
 
@@ -153,6 +154,25 @@ describe('orphans pure data fn — IRON RULE byte-identical contract', () => {
     }
     expect(logBuffer[0]).toBe(String(direct.total_orphans));
   });
+
+  test('generated source and flight-alert pages are excluded from numerator and denominator', async () => {
+    await engine.putPage('sources/twilio/call-1', {
+      type: 'source', title: 'Call 1', compiled_truth: 'generated call log', timeline: '', frontmatter: { domain: 'source' },
+    });
+    await engine.putPage('flight-alert-bundles/bundle-1', {
+      type: 'note', title: 'Bundle 1', compiled_truth: 'generated flight alert bundle', timeline: '', frontmatter: { domain: 'flight-alert-bundle' },
+    });
+    await engine.putPage('people/alice', {
+      type: 'person', title: 'Alice', compiled_truth: 'curated person page', timeline: '', frontmatter: { domain: 'people' },
+    });
+
+    const result = await findOrphans(engine, { includePseudo: false });
+
+    expect(result.total_pages).toBe(3);
+    expect(result.total_linkable).toBe(1);
+    expect(result.total_orphans).toBe(1);
+    expect(result.orphans.map((p) => p.slug)).toEqual(['people/alice']);
+  });
 });
 
 describe('shouldExclude — orphan filter regression (preserve curation)', () => {
@@ -189,5 +209,13 @@ describe('shouldExclude — orphan filter regression (preserve curation)', () =>
     expect(shouldExclude('people/alice')).toBe(false);
     expect(shouldExclude('companies/acme')).toBe(false);
     expect(shouldExclude('writing/post-1')).toBe(false);
+  });
+
+  test('generated source and flight-alert domains are excluded from orphan scoring', () => {
+    expect(shouldExcludeGeneratedDomain('source', 'sources/twilio/call-1')).toBe(true);
+    expect(shouldExcludeGeneratedDomain('flight-alert-bundle', 'alerts/bundle-1')).toBe(true);
+    expect(shouldExcludeGeneratedDomain(null, 'sources/twilio/call-1')).toBe(true);
+    expect(shouldExcludeGeneratedDomain(null, 'flight-alert-bundles/bundle-1')).toBe(true);
+    expect(shouldExcludeGeneratedDomain('people', 'people/alice')).toBe(false);
   });
 });

@@ -89,6 +89,9 @@ export {
 } from './registry.ts';
 
 export {
+  BUNDLED_SCHEMA_PACK_NAMES,
+  listBundledSchemaPackNames,
+  locateSchemaPackFile,
   loadActivePack,
   resolveActivePackNameOnly,
   __setPackLocatorForTests,

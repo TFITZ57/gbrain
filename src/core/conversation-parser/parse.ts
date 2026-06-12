@@ -143,6 +143,37 @@ function extractTimezone(page: ParseConversationOpts['page']): string | undefine
 }
 
 /**
+ * Call-log pages without a transcript are not parser misses. They are
+ * structured event records, so doctor coverage should exclude them instead
+ * of treating them as broken conversation formats.
+ */
+export function isNoTranscriptCallLog(
+  body: string,
+  page?: ParseConversationOpts['page'],
+): boolean {
+  const title = typeof page?.title === 'string' ? page.title : '';
+  const slug = typeof page?.slug === 'string' ? page.slug : '';
+  const haystack = `${slug}\n${title}\n${body}`.toLowerCase();
+  const bodyLower = body.toLowerCase();
+  const looksLikeCallLog =
+    /\b(call log|call sid|twilio|voice call|phone call)\b/.test(haystack) ||
+    (
+      /\bfrom\s*:/i.test(body) &&
+      /\bto\s*:/i.test(body) &&
+      /\b(direction|duration|call status|status)\s*:/i.test(body)
+    );
+  if (!looksLikeCallLog) return false;
+
+  const explicitNoTranscript =
+    /\b(no transcript|transcript unavailable|without transcript|no call transcript|transcript not available)\b/.test(bodyLower);
+  const hasTranscriptSection =
+    /\b(transcript|speaker diarization|speaker transcript)\b/.test(bodyLower) &&
+    !explicitNoTranscript;
+
+  return !hasTranscriptSection;
+}
+
+/**
  * Map a 12-hour pattern to 24-hour using the AM/PM marker.
  * 12 AM = 0, 12 PM = 12, 1..11 PM = 13..23.
  */

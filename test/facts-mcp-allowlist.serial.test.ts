@@ -4,8 +4,9 @@
  * Pins:
  *   - extract_facts → write scope
  *   - recall → read scope
+ *   - update_fact → write scope
  *   - forget_fact → write scope
- *   - All three present in operations[]
+ *   - All four present in operations[]
  *   - param shapes match the documented contract
  *
  * Serial test (mutates module-scoped engine state via dispatchToolCall +
@@ -57,6 +58,16 @@ describe('facts MCP ops registration + scope', () => {
     expect(op!.mutating).toBe(true);
     expect(op!.params.id?.required).toBe(true);
   });
+
+  test('update_fact is registered with write scope', () => {
+    const op = operations.find(o => o.name === 'update_fact');
+    expect(op).toBeDefined();
+    expect(op!.scope).toBe('write');
+    expect(op!.mutating).toBe(true);
+    expect(op!.params.id?.required).toBe(true);
+    expect(op!.params.fact?.required).toBe(true);
+    expect(op!.params.entity_hints?.items?.type).toBe('string');
+  });
 });
 
 describe('forget_fact dispatch', () => {
@@ -102,5 +113,6 @@ describe('extract_facts dispatch (no API key)', () => {
     expect(payload.duplicate).toBe(0);
     expect(payload.superseded).toBe(0);
     expect(Array.isArray(payload.fact_ids)).toBe(true);
+    expect(payload.skipped).toBe('chat_unavailable');
   });
 });

@@ -11,6 +11,7 @@ import { probeOllama, probeLMStudio } from '../core/ai/probes.ts';
 import { loadConfig } from '../core/config.ts';
 import { AIConfigError, AITransientError } from '../core/ai/errors.ts';
 import type { Recipe } from '../core/ai/types.ts';
+import type { GBrainConfig } from '../core/config.ts';
 
 const SCHEMA_VERSION = 1;
 
@@ -31,8 +32,21 @@ interface ProviderOption {
   cons: string[];
 }
 
+export function providerEnvWithConfig(
+  config: Pick<GBrainConfig, 'openai_api_key' | 'anthropic_api_key' | 'zeroentropy_api_key'> | null | undefined,
+  env: NodeJS.ProcessEnv = process.env,
+): NodeJS.ProcessEnv {
+  return {
+    ...(config?.openai_api_key ? { OPENAI_API_KEY: config.openai_api_key } : {}),
+    ...(config?.anthropic_api_key ? { ANTHROPIC_API_KEY: config.anthropic_api_key } : {}),
+    ...(config?.zeroentropy_api_key ? { ZEROENTROPY_API_KEY: config.zeroentropy_api_key } : {}),
+    ...env,
+  };
+}
+
 function configureFromEnv(): void {
   const config = loadConfig();
+  const env = providerEnvWithConfig(config);
   configureGateway({
     embedding_model: config?.embedding_model,
     embedding_dimensions: config?.embedding_dimensions,
@@ -40,8 +54,11 @@ function configureFromEnv(): void {
     chat_model: config?.chat_model,
     chat_fallback_chain: config?.chat_fallback_chain,
     base_urls: config?.provider_base_urls,
-    env: { ...process.env },
+    env,
   });
+  for (const key of ['OPENAI_API_KEY', 'ANTHROPIC_API_KEY', 'ZEROENTROPY_API_KEY'] as const) {
+    if (!process.env[key] && env[key]) process.env[key] = env[key];
+  }
 }
 
 export function envReady(recipe: Recipe, env: NodeJS.ProcessEnv = process.env): boolean {
