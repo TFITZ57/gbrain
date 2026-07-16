@@ -167,3 +167,55 @@ describe('hybridSearch unified routing (Phase 3)', () => {
     expect(openaiCalled).toBe(0);
   });
 });
+
+describe('unified routing: cosine re-score runs in the multimodal space', () => {
+  test('re-score hydrates from embedding_multimodal, not the text column', async () => {
+    await engine.setConfig('search.unified_multimodal', 'true');
+    fetchHandler = async (url) => {
+      if (url.includes('multimodalembeddings')) {
+        return new Response(JSON.stringify({
+          data: [{ embedding: Array.from({ length: 1024 }, () => 0.1), index: 0 }],
+        }), { status: 200 });
+      }
+      return new Response(JSON.stringify({
+        data: [{ embedding: Array.from({ length: 1536 }, () => 0.1), index: 0 }],
+      }), { status: 200 });
+    };
+
+    // Seed one chunk whose unified-column vector matches the mocked Voyage
+    // embedding, so the unified arm returns a row and the re-score fires.
+    await engine.putPage('concepts/unified-rescore', {
+      type: 'concept',
+      title: 'Unified Rescore',
+      compiled_truth: 'unified rescore threading fixture',
+    });
+    await engine.upsertChunks('concepts/unified-rescore', [{
+      chunk_index: 0,
+      chunk_text: 'unified rescore threading fixture',
+      chunk_source: 'compiled_truth',
+    }]);
+    await engine.executeRaw(
+      `UPDATE content_chunks SET embedding_multimodal = $1::vector`,
+      [`[${Array.from({ length: 1024 }, () => 0.1).join(',')}]`],
+    );
+
+    // Spy on the SQL re-score seam to capture which column it scores in.
+    // The query embedding is 1024d multimodal; scoring against the 1536d
+    // text column would dimension-error and silently skip the re-score
+    // (that was the pre-fix behavior with the resolved text column).
+    const original = engine.getCosineSimilaritiesByChunkIds.bind(engine);
+    const seenColumns: unknown[] = [];
+    const spy: typeof original = async (ids, q, col) => {
+      seenColumns.push(col);
+      return original(ids, q, col);
+    };
+    (engine as unknown as { getCosineSimilaritiesByChunkIds: typeof original }).getCosineSimilaritiesByChunkIds = spy;
+    try {
+      const results = await hybridSearch(engine, 'unified rescore threading fixture', { limit: 5 });
+      expect(results.length).toBeGreaterThan(0);
+      expect(seenColumns).toEqual(['embedding_multimodal']);
+    } finally {
+      (engine as unknown as { getCosineSimilaritiesByChunkIds: typeof original }).getCosineSimilaritiesByChunkIds = original;
+    }
+  });
+});

@@ -2031,6 +2031,42 @@ export class PGLiteEngine implements BrainEngine {
     return result;
   }
 
+  async getCosineSimilaritiesByChunkIds(
+    ids: number[],
+    queryEmbedding: Float32Array,
+    column?: SearchOpts['embeddingColumn'],
+  ): Promise<Map<number, number>> {
+    if (ids.length === 0) return new Map();
+    // Mirrors postgres-engine.ts: same normalization + quoting discipline
+    // as searchVector (D11/D12).
+    const resolvedCol = normalizeEngineColumn(column);
+    const { col } = buildVectorCastFragment(resolvedCol);
+    // Score in float precision regardless of column type. searchVector's
+    // halfvec cast fragment would QUANTIZE the query to half precision
+    // before the distance, shifting near-tie scores relative to the
+    // client-parity contract (the download path cosines the Float32 query
+    // against the stored, already-quantized values). Upcasting the stored
+    // halfvec to vector keeps the stored values bit-identical while the
+    // query stays float; this is an id-list lookup, not an index scan, so
+    // the cast costs nothing.
+    const colExpr = resolvedCol.type === 'halfvec' ? `${col}::vector` : col;
+    const vecStr = '[' + Array.from(queryEmbedding).join(',') + ']';
+    const { rows } = await this.db.query(
+      `SELECT id, 1 - (${colExpr} <=> $1::vector) AS cosine
+         FROM content_chunks
+        WHERE id = ANY($2::int[]) AND ${col} IS NOT NULL`,
+      [vecStr, ids]
+    );
+    const result = new Map<number, number>();
+    for (const row of rows as Record<string, unknown>[]) {
+      const c = Number(row.cosine);
+      // NaN (zero-magnitude chunk vector) → 0, matching the client-side
+      // cosineSimilarity denom===0 contract.
+      result.set(row.id as number, Number.isFinite(c) ? c : 0);
+    }
+    return result;
+  }
+
   // v0.41.18.0 — lazy-cached resolveBulkRetryOpts result + batch-retry helper.
   // PGLite has no Postgres pooler so retries don't fire in production; the
   // wrap is for engine-parity tests (T7) and a DI-friendly seam via the
