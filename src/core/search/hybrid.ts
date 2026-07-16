@@ -739,6 +739,24 @@ export interface HybridSearchOpts extends SearchOpts {
    * a fresh per-call deadline. Not part of the public contract.
    */
   _queryEmbedDeadline?: QueryEmbedDeadline;
+  /**
+   * INTERNAL: the query embedding `hybridSearchCached` already computed for
+   * its cache probe, threaded into the inner `hybridSearch` on a cache miss
+   * so the same query string isn't embedded twice (the second embed is a
+   * pure duplicate provider round-trip, 0.3-0.8s on remote setups).
+   * `embedOpts` records the exact opts the probe embedded with; the inner
+   * text path reuses the vector ONLY when its own resolved embed opts match.
+   * The column config lives in the DB, so the wrapper's config read and the
+   * inner read can disagree if config changes between them; the match gate
+   * keeps a vector from one embedding space from being searched against
+   * another. On mismatch, and for expansion variants (q !== query), the
+   * inner path embeds fresh. Direct `hybridSearch` callers leave it
+   * undefined. Not part of the public contract.
+   */
+  _cacheProbeEmbedding?: {
+    embedding: Float32Array;
+    embedOpts?: { embeddingModel?: string; dimensions?: number };
+  };
 }
 
 /**
@@ -1253,7 +1271,24 @@ export async function hybridSearch(
       // share one ~6s budget); direct callers get a fresh deadline. On timeout
       // the embed throws → the catch below falls back to keyword-only.
       const embedDl = opts?._queryEmbedDeadline ?? makeQueryEmbedDeadline();
-      const embeddings = await Promise.all(queries.map(q => embedQueryBounded(q, embedOpts, embedDl)));
+      // Reuse the cache-probe embedding for the original query when
+      // hybridSearchCached threaded one through: re-embedding the identical
+      // string is a wasted provider round-trip on every cache miss. Reuse is
+      // gated on the probe's recorded embed opts matching THIS call's
+      // resolution (model + dimensions). The column config lives in the DB,
+      // so the wrapper's read and this read can disagree if config changed
+      // between them; a mismatched probe vector would be from the wrong
+      // embedding space, so it is discarded and the query embeds fresh.
+      // Expansion variants (q !== query) always embed fresh.
+      const probe = opts?._cacheProbeEmbedding;
+      const probeSpaceMatches = probe !== undefined
+        && probe.embedOpts?.embeddingModel === embedOpts?.embeddingModel
+        && probe.embedOpts?.dimensions === embedOpts?.dimensions;
+      const embeddings = await Promise.all(queries.map(q =>
+        probe && probeSpaceMatches && q === query
+          ? Promise.resolve(probe.embedding)
+          : embedQueryBounded(q, embedOpts, embedDl),
+      ));
       queryEmbedding = embeddings[0];
       const textLists = await Promise.all(
         embeddings.map(emb => engine.searchVector(emb, searchOpts)),
@@ -1681,6 +1716,19 @@ export async function hybridSearchCached(
   // sees the already-elapsed budget and fails fast → keyword fallback. Worst
   // case ~one timeout (~6s), comfortably under the CLI 10s force-exit.
   const queryEmbedDl = makeQueryEmbedDeadline();
+  // Embed opts for the cache probe: the resolved column's opts, the SAME
+  // derivation the inner hybridSearch text path uses, so on a miss the
+  // embedding can be threaded through (_cacheProbeEmbedding) instead of
+  // re-embedding the identical query. isCacheSafe already pinned this
+  // column's space (name + dim + model) to the config default, so this
+  // matches the previous gateway-default embed in any consistent config,
+  // and keeps the probe consistent with the knobs_hash (which folds
+  // resolvedColCached.embeddingModel) when config and gateway drift.
+  // Threaded alongside the embedding so the inner path can verify its own
+  // resolution still matches before reusing the vector.
+  const probeEmbedOpts = resolvedColCached.embeddingModel
+    ? { embeddingModel: resolvedColCached.embeddingModel, dimensions: resolvedColCached.dimensions }
+    : undefined;
   if (!skipCache) {
     try {
       const { isAvailable } = await import('../ai/gateway.ts');
@@ -1695,7 +1743,8 @@ export async function hybridSearchCached(
         // v0.42.20.0 (Fix 3) — bounded by the shared deadline; on timeout this
         // throws → caught below → cacheStatus 'disabled' → falls through to the
         // inner hybridSearch (which reuses the same elapsed deadline).
-        queryEmbedding = await embedQueryBounded(query, undefined, queryEmbedDl);
+        // probeEmbedOpts derivation + rationale live at its declaration above.
+        queryEmbedding = await embedQueryBounded(query, probeEmbedOpts, queryEmbedDl);
       } else {
         cacheStatus = 'disabled';
       }
@@ -1761,6 +1810,12 @@ export async function hybridSearchCached(
     // v0.42.20.0 (Fix 3) — share the query-embed deadline so the inner embed
     // doesn't start a fresh 6s budget after the cache-lookup already spent it.
     _queryEmbedDeadline: queryEmbedDl,
+    // Thread the cache-probe embedding, plus the embed opts it was computed
+    // with, so the miss path can skip the second provider round-trip when
+    // (and only when) its own resolution matches (see HybridSearchOpts).
+    ...(queryEmbedding
+      ? { _cacheProbeEmbedding: { embedding: queryEmbedding, embedOpts: probeEmbedOpts } }
+      : {}),
     onMeta: (m) => {
       innerMetaBox.current = m;
       // Do NOT call userOnMeta here — we'll emit a merged meta below
