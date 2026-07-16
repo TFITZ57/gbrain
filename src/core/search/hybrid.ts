@@ -966,8 +966,22 @@ export async function hybridSearch(
   const earlyModality = (opts?.crossModal && opts.crossModal !== 'auto')
     ? opts.crossModal
     : (suggestions.suggestedModality ?? 'text');
-  const keywordResults: SearchResult[] =
-    earlyModality === 'image' ? [] : await engine.searchKeyword(query, searchOpts);
+  // Dispatch keyword search WITHOUT awaiting it: nothing consumes the rows
+  // until fusion (or one of the two keyword-only early returns), so the
+  // vector arm's embed + HNSW round-trips, the relational arm, expansion,
+  // and the modality tie-break all overlap it instead of queuing behind it
+  // (~0.6s on remote setups). Exactly three consumers await it below: the
+  // no-embedding-provider path, the vector-failed fallback path, and the
+  // RRF fusion input. A keyword error therefore still rejects hybridSearch
+  // on every path, just at the await site instead of here. The no-op catch
+  // marks the rejection handled in case an unrelated throw unwinds this
+  // call before a consumer awaits (same pattern as embedQueryBounded);
+  // awaiting the original promise still rethrows the keyword error.
+  const keywordPromise: Promise<SearchResult[]> =
+    earlyModality === 'image'
+      ? Promise.resolve([])
+      : engine.searchKeyword(query, searchOpts);
+  keywordPromise.catch(() => { /* handled at the await sites */ });
 
   // v0.29.1: resolve salience/recency from caller (back-compat aliases for
   // PR #618's `recencyBoost` numeric scale) or fall back to the heuristic.
@@ -1046,11 +1060,11 @@ export async function hybridSearch(
     // v0.43 — fuse the relational arm with keyword so typed-edge answers
     // survive on the no-embedding-provider path (the relational win is most
     // valuable exactly when vector is unavailable).
-    let noEmbedResults = keywordResults;
+    let noEmbedResults = await keywordPromise;
     if (relationalList.length > 0) {
       const fk = opts?.rrfK ?? RRF_K;
       noEmbedResults = rrfFusionWeighted(
-        [{ list: keywordResults, k: fk }, { list: relationalList, k: fk }],
+        [{ list: noEmbedResults, k: fk }, { list: relationalList, k: fk }],
         detailResolved !== 'high',
       );
     }
@@ -1280,11 +1294,11 @@ export async function hybridSearch(
     // does nothing on embed failures.
     // v0.43: fuse the relational arm with keyword via RRF so typed-edge
     // answers survive even when vector is unavailable.
-    let fallbackResults = keywordResults;
+    let fallbackResults = await keywordPromise;
     if (relationalList.length > 0) {
       const fk = opts?.rrfK ?? RRF_K;
       fallbackResults = rrfFusionWeighted(
-        [{ list: keywordResults, k: fk }, { list: relationalList, k: fk }],
+        [{ list: fallbackResults, k: fk }, { list: relationalList, k: fk }],
         detail !== 'high',
       );
     }
@@ -1336,6 +1350,10 @@ export async function hybridSearch(
   const textRrfK = effectiveRrfK(baseRrfK, resolvedMode.cross_modal_both_text_weight);
   const imageRrfK = effectiveRrfK(baseRrfK, resolvedMode.cross_modal_both_image_weight);
   const isBothMode = effectiveModality === 'both' && vectorLists.length >= 2;
+
+  // Fusion is the first (and last) consumer of the keyword rows on the main
+  // path: join the arm dispatched before the vector section here.
+  const keywordResults = await keywordPromise;
 
   const allLists: Array<{ list: SearchResult[]; k: number }> = isBothMode
     ? [
