@@ -941,6 +941,33 @@ export interface BrainEngine {
    * interpolation as defense in depth (D12).
    */
   getEmbeddingsByChunkIds(ids: number[], column?: string): Promise<Map<number, Float32Array>>;
+  /**
+   * Cosine similarity between a query embedding and chunks already known
+   * by id, computed IN SQL (pgvector `<=>`), returning only the scores.
+   * The client-side alternative (getEmbeddingsByChunkIds + local cosine)
+   * downloads N full vectors (e.g. 50 x 1280 float32) just to reduce each
+   * to a single float; on remote databases that transfer dominates the
+   * hybrid re-score stage (0.6-0.9s per query).
+   *
+   * `column` takes the same string/descriptor union as
+   * SearchOpts.embeddingColumn; engines normalize via normalizeEngineColumn
+   * and reuse searchVector's identifier quoting (D12 defense in depth).
+   * Scores match the client-side path to float precision for EVERY column
+   * type: halfvec columns are upcast to vector in SQL so the query is never
+   * quantized (only the stored values already are, same as the download
+   * path). Chunks whose column is NULL are absent from the returned map. A
+   * zero-magnitude chunk vector produces NaN in SQL; implementations map
+   * non-finite similarities to 0, matching cosineSimilarity's denom===0
+   * contract.
+   *
+   * OPTIONAL: hybrid.cosineReScore falls back to the download path when an
+   * engine (or test double) doesn't implement it.
+   */
+  getCosineSimilaritiesByChunkIds?(
+    ids: number[],
+    queryEmbedding: Float32Array,
+    column?: SearchOpts['embeddingColumn'],
+  ): Promise<Map<number, number>>;
 
   // Chunks
   /**

@@ -2028,6 +2028,44 @@ export class PostgresEngine implements BrainEngine {
     return result;
   }
 
+  async getCosineSimilaritiesByChunkIds(
+    ids: number[],
+    queryEmbedding: Float32Array,
+    column?: SearchOpts['embeddingColumn'],
+  ): Promise<Map<number, number>> {
+    if (ids.length === 0) return new Map();
+    // Same column normalization + identifier-quoting discipline as
+    // searchVector (D11/D12): the caller passes the resolved descriptor;
+    // unknown bare strings throw in normalizeEngineColumn before any SQL.
+    const resolvedCol = normalizeEngineColumn(column);
+    const { col } = buildVectorCastFragment(resolvedCol);
+    // Score in float precision regardless of column type. searchVector's
+    // halfvec cast fragment would QUANTIZE the query to half precision
+    // before the distance, shifting near-tie scores relative to the
+    // client-parity contract (the download path cosines the Float32 query
+    // against the stored, already-quantized values). Upcasting the stored
+    // halfvec to vector keeps the stored values bit-identical while the
+    // query stays float; this is an id-list lookup, not an index scan, so
+    // the cast costs nothing.
+    const colExpr = resolvedCol.type === 'halfvec' ? `${col}::vector` : col;
+    const vecStr = '[' + Array.from(queryEmbedding).join(',') + ']';
+    const sql = this.sql;
+    const rawQuery = `
+      SELECT id, 1 - (${colExpr} <=> $1::vector) AS cosine
+      FROM content_chunks
+      WHERE id = ANY($2::int[]) AND ${col} IS NOT NULL
+    `;
+    const rows = await sql.unsafe(rawQuery, [vecStr, ids] as Parameters<typeof sql.unsafe>[1]);
+    const result = new Map<number, number>();
+    for (const row of rows) {
+      const c = Number(row.cosine);
+      // NaN (zero-magnitude chunk vector) → 0, matching the client-side
+      // cosineSimilarity denom===0 contract.
+      result.set(row.id as number, Number.isFinite(c) ? c : 0);
+    }
+    return result;
+  }
+
   // v0.41.18.0: lazy-cached resolveBulkRetryOpts result. Constructor-time
   // resolution would force env validation at module-load, which breaks tests
   // that withEnv-mutate after engine construction. Lazy + cache-once preserves

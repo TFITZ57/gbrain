@@ -1224,6 +1224,14 @@ export async function hybridSearch(
   let queryEmbedding: Float32Array | null = null;
   let imageVectorList: SearchResult[] | null = null;
   let crossModalFellOpen = false;
+  // Column the vector arm actually ranked against. The cosine re-score must
+  // hydrate/score in the SAME space as queryEmbedding: the text path scores
+  // against resolvedCol, and the unified path overrides BOTH the embedding
+  // (multimodal query vector) and this column. Without the override the
+  // re-score would pair a 1024d multimodal query with the text column
+  // (dimension mismatch: silently unrescored; equal dims: scored against
+  // the wrong space).
+  let rescoreColumn: SearchOpts['embeddingColumn'] = resolvedCol;
 
   // Phase 3 unified routing: when on, route ALL queries through Voyage
   // multimodal-3 + embedding_multimodal column. Bypasses the dual-column
@@ -1254,6 +1262,9 @@ export async function hybridSearch(
       } else {
         vectorLists = [unifiedList];
         queryEmbedding = unifiedEmbedding;
+        // Re-score must run in the space this embedding lives in (the same
+        // column the searchVector above just ranked against).
+        rescoreColumn = 'embedding_multimodal';
         unifiedDone = true;
       }
     } catch (err) {
@@ -1451,7 +1462,11 @@ export async function hybridSearch(
   // in the same vector space the HNSW just ranked in. Pre-v0.36 this
   // always pulled from `embedding` and silently corrupted alt-column ranks.
   if (queryEmbedding) {
-    fused = await cosineReScore(engine, fused, queryEmbedding, resolvedCol.name);
+    // Pass the column the vector arm ranked against (full descriptor where
+    // available, so the engine's SQL re-score path can build the right cast
+    // for halfvec columns; the unified path passes the built-in multimodal
+    // column name, the same value its searchVector call used).
+    fused = await cosineReScore(engine, fused, queryEmbedding, rescoreColumn);
   }
 
   // v0.29.1: post-fusion stages (backlink + salience + recency) run via
@@ -2056,7 +2071,7 @@ async function cosineReScore(
   engine: BrainEngine,
   results: SearchResult[],
   queryEmbedding: Float32Array,
-  column: string = 'embedding',
+  column: SearchOpts['embeddingColumn'] = 'embedding',
 ): Promise<SearchResult[]> {
   const chunkIds = results
     .map(r => r.chunk_id)
@@ -2064,28 +2079,43 @@ async function cosineReScore(
 
   if (chunkIds.length === 0) return results;
 
-  let embeddingMap: Map<number, Float32Array>;
+  // v0.36 (D9): score against the active column so rescore happens in
+  // the same embedding space the HNSW just ranked in. Without this,
+  // a Voyage HNSW retrieval would HNSW-rank against Voyage vectors but
+  // rescore against OpenAI vectors → NaN or wrong rankings.
+  //
+  // perf: compute the cosine IN SQL when the engine supports it. The
+  // download path pulls N full vectors (e.g. 50 × 1280 float32) across the
+  // wire just to reduce each to a single float; pgvector's `<=>` computes
+  // the same similarity where the data lives and returns only the scores
+  // (0.6-0.9s per query on remote databases). Engines without the method
+  // (older forks, test doubles) keep the download path.
+  let cosines: Map<number, number>;
   try {
-    // v0.36 (D9): hydrate from the active column so rescore happens in
-    // the same embedding space the HNSW just ranked in. Without this,
-    // a Voyage HNSW retrieval would HNSW-rank against Voyage vectors but
-    // rescore against OpenAI vectors → NaN or wrong rankings.
-    embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds, column);
+    if (typeof engine.getCosineSimilaritiesByChunkIds === 'function') {
+      cosines = await engine.getCosineSimilaritiesByChunkIds(chunkIds, queryEmbedding, column);
+    } else {
+      const columnName = typeof column === 'string' ? column : column.name;
+      const embeddingMap = await engine.getEmbeddingsByChunkIds(chunkIds, columnName);
+      cosines = new Map<number, number>();
+      for (const [id, emb] of embeddingMap) {
+        cosines.set(id, cosineSimilarity(queryEmbedding, emb));
+      }
+    }
   } catch {
     // DB error is non-fatal, return results without re-scoring
     return results;
   }
 
-  if (embeddingMap.size === 0) return results;
+  if (cosines.size === 0) return results;
 
   // Normalize RRF scores to 0-1 for blending
   const maxRrf = Math.max(...results.map(r => r.score));
 
   return results.map(r => {
-    const chunkEmb = r.chunk_id != null ? embeddingMap.get(r.chunk_id) : undefined;
-    if (!chunkEmb) return r;
+    const cosine = r.chunk_id != null ? cosines.get(r.chunk_id) : undefined;
+    if (cosine === undefined) return r;
 
-    const cosine = cosineSimilarity(queryEmbedding, chunkEmb);
     const normRrf = maxRrf > 0 ? r.score / maxRrf : 0;
     const blended = 0.7 * normRrf + 0.3 * cosine;
 
