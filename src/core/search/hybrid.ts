@@ -453,17 +453,6 @@ export async function runPostFusionStages(
   // see plan `swift-sniffing-nygaard.md` D6 / codex outside-voice T2.
   const floorThreshold = computeFloorThreshold(results, opts.floorRatio);
 
-  // Backlink stage (existing behavior, preserved).
-  if (opts.applyBacklinks) {
-    try {
-      const slugs = Array.from(new Set(results.map(r => r.slug)));
-      const counts = await engine.getBacklinkCounts(slugs);
-      applyBacklinkBoost(results, counts, floorThreshold);
-    } catch {
-      // Non-fatal; preserves the existing pre-v0.29.1 contract.
-    }
-  }
-
   // Composite refs for the orthogonal axes (multi-source isolation).
   const refs = Array.from(
     new Map(
@@ -471,32 +460,74 @@ export async function runPostFusionStages(
     ).values(),
   );
 
+  // Kick off the three metadata fetches CONCURRENTLY: they read independent
+  // data (backlink counts, salience scores, effective dates) keyed only on
+  // slugs/refs, which no boost mutates. Sequential awaits paid three DB
+  // round-trips back to back on every query (~0.5-0.7s on remote setups).
+  // The BOOSTS still apply strictly in the original order below (backlink,
+  // then salience, then recency) because application order determines score
+  // attribution; only the fetches overlap. Each fetch resolves to null on
+  // ANY failure (skipping just that boost) so the per-stage non-fatal
+  // contract is preserved exactly: one failed fetch never disables the
+  // other stages. The async wrapper matters: it converts a SYNCHRONOUS
+  // throw from the engine call (a test double or minimal engine missing
+  // the method, a non-async implementation throwing before it returns a
+  // promise) into a rejection the catch absorbs, exactly like the
+  // try/catch that wrapped each sequential await before this change.
+  const fetchOrNull = <T>(fn: () => Promise<T>): Promise<T | null> =>
+    (async () => fn())().catch(() => null);
+  const backlinkFetch = opts.applyBacklinks
+    ? fetchOrNull(() => engine.getBacklinkCounts(Array.from(new Set(results.map(r => r.slug)))))
+    : null;
+  const salienceFetch = opts.salience !== 'off'
+    ? fetchOrNull(() => engine.getSalienceScores(refs))
+    : null;
+  const datesFetch = opts.recency !== 'off'
+    ? fetchOrNull(() => engine.getEffectiveDates(refs))
+    : null;
+
+  // Backlink stage (existing behavior, preserved).
+  if (backlinkFetch) {
+    const counts = await backlinkFetch;
+    if (counts) {
+      try {
+        applyBacklinkBoost(results, counts, floorThreshold);
+      } catch {
+        // Non-fatal; preserves the existing pre-v0.29.1 contract.
+      }
+    }
+  }
+
   // Salience stage (mattering, no time).
   if (opts.salience !== 'off') {
-    try {
-      const scores = await engine.getSalienceScores(refs);
-      applySalienceBoost(results, scores, opts.salience, floorThreshold);
-    } catch {
-      // Non-fatal.
+    const scores = salienceFetch ? await salienceFetch : null;
+    if (scores) {
+      try {
+        applySalienceBoost(results, scores, opts.salience, floorThreshold);
+      } catch {
+        // Non-fatal.
+      }
     }
   }
 
   // Recency stage (per-prefix decay, no mattering).
   if (opts.recency !== 'off') {
-    try {
-      const dates = await engine.getEffectiveDates(refs);
-      const { DEFAULT_RECENCY_DECAY, DEFAULT_FALLBACK } = await import('./recency-decay.ts');
-      applyRecencyBoost(
-        results,
-        dates,
-        opts.recency,
-        opts.decayMap ?? DEFAULT_RECENCY_DECAY,
-        opts.fallback ?? DEFAULT_FALLBACK,
-        Date.now(),
-        floorThreshold,
-      );
-    } catch {
-      // Non-fatal.
+    const dates = datesFetch ? await datesFetch : null;
+    if (dates) {
+      try {
+        const { DEFAULT_RECENCY_DECAY, DEFAULT_FALLBACK } = await import('./recency-decay.ts');
+        applyRecencyBoost(
+          results,
+          dates,
+          opts.recency,
+          opts.decayMap ?? DEFAULT_RECENCY_DECAY,
+          opts.fallback ?? DEFAULT_FALLBACK,
+          Date.now(),
+          floorThreshold,
+        );
+      } catch {
+        // Non-fatal.
+      }
     }
 
     // v0.42.x — Life Chronicle (#2390) E1: chronicle event/diary type boost.
