@@ -376,7 +376,10 @@ export async function startResolveIpcSupervisorForServe(
       owner = null;
     }
     owner = await starter();
-    if (owner) nextKeepaliveAt = Date.now() + keepaliveMs;
+    if (owner) {
+      nextKeepaliveAt = Date.now();
+      launchKeepConnectionWarm();
+    }
     schedule(owner ? monitorMs : retryMs);
   };
 
