@@ -32,7 +32,12 @@ import {
   DEFAULT_MAX_POINTERS,
   type ReflexPointer,
 } from './retrieval-reflex.ts';
-import { volunteerContext, type VolunteeredPage } from './volunteer.ts';
+import {
+  candidatesByNorm,
+  gateVolunteeredPointers,
+  VOLUNTEER_MAX_PAGES_CAP,
+  type VolunteeredPage,
+} from './volunteer.ts';
 import { getBrainHotMemoryMeta } from '../facts/meta-hook.ts';
 import { buildEntityCard, type EntityCard, type EntityOpenThread } from '../verbs/entity-card.ts';
 
@@ -206,52 +211,38 @@ export async function assembleTurnContext(
       : TURN_CONTEXT_DEFAULT_MAX_BYTES;
   const window = Array.isArray(opts.window) ? opts.window : [];
 
-  // Sections 1+2 form a dependent chain (volunteer dedupes against the
-  // pointers surfaced THIS turn); section 3 is independent, so the two arms
-  // run concurrently — the caller sits behind the 400ms IPC server budget
-  // [G11], and serializing an independent DB read wastes it. Each arm keeps
-  // its own try/catch degradation (an error empties that arm, never the block).
+  // Sections 1+2 share ONE resolver pass. The prior path called
+  // resolveEntitiesToPointers twice, which doubled cross-region Postgres work.
+  // Resolve a pool for both consumers, slice the pointer cap, then run the
+  // volunteer confidence gate over that same pool.
 
   // Arm A: reflex pointers → volunteered pages.
   const pointersVolunteerArm = (async (): Promise<{
     pointers: ReflexPointer[];
     volunteered: VolunteeredPage[];
   }> => {
-    // 1. Reflex pointers — window candidate extraction + precision-biased
-    //    resolution, slug-only suppression (the windowed contract, codex D7).
     let pointers: ReflexPointer[] = [];
+    let volunteered: VolunteeredPage[] = [];
     try {
       const candidates = extractCandidatesFromWindow(window);
       if (candidates.length) {
         const block = await resolveEntitiesToPointers(engine, opts.sourceId, candidates, {
           priorContextText: opts.priorContextText,
           suppression: 'slug-only',
-          maxPointers: DEFAULT_MAX_POINTERS,
+          maxPointers: VOLUNTEER_MAX_PAGES_CAP * 2,
           lexicalArms: opts.lexicalArms,
         });
-        pointers = block?.pointers ?? [];
+        if (block) {
+          pointers = block.pointers.slice(0, DEFAULT_MAX_POINTERS);
+          volunteered = gateVolunteeredPointers(block, candidatesByNorm(candidates), {
+            excludeSlugs: new Set(pointers.map((p) => p.slug)),
+            maxPages: MAX_VOLUNTEERED_PAGES,
+            windowSize: window.length,
+          });
+        }
       }
     } catch {
       pointers = [];
-    }
-
-    // 2. Volunteered pages (≤3), excluding slugs already surfaced as pointers
-    //    this turn; priorContextText suppression handles earlier turns.
-    let volunteered: VolunteeredPage[] = [];
-    try {
-      if (window.length) {
-        const excludeSlugs = new Set(pointers.map((p) => p.slug));
-        volunteered = await volunteerContext(engine, window, {
-          sourceIds: [opts.sourceId],
-          priorContext: opts.priorContextText,
-          excludeSlugs,
-          maxPages: MAX_VOLUNTEERED_PAGES,
-          // v0.46.15+ lexical-arms kill switch rides the same threading as the
-          // pointer arm above (ResolvePointersOpts.lexicalArms).
-          lexicalArms: opts.lexicalArms,
-        });
-      }
-    } catch {
       volunteered = [];
     }
     return { pointers, volunteered };
@@ -388,7 +379,7 @@ export function isAfter(value: string | null | undefined, since: string): boolea
  * Race `work` against a wall-clock budget. Returns 'deadline' if the timer
  * fired first (the caller then renders whatever its accumulator collected — a
  * PARTIAL pack), or undefined if the work finished in time. This is the
- * substrate the push path's 400ms budget needs; assembleTurnContext has no
+ * substrate the push path's bounded budget needs; assembleTurnContext has no
  * built-in abort, so arms must mutate a shared accumulator as they resolve.
  */
 async function raceDeadline(work: Promise<void>, ms?: number): Promise<string | undefined> {

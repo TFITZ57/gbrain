@@ -54,7 +54,7 @@ import {
 } from '../mcp/surface.ts';
 import { writeSurfaceChangeAudit } from '../core/surface-audit.ts';
 import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
-import { bindResolveIpcForServe } from '../mcp/resolve-ipc-binding.ts';
+import { startResolveIpcSupervisorForServe } from '../mcp/resolve-ipc-binding.ts';
 import { resolveMcpStdioSourceScope } from '../mcp/server.ts';
 import { loadConfig } from '../core/config.ts';
 import { buildError, serializeError } from '../core/errors.ts';
@@ -3246,10 +3246,19 @@ export async function runServeHttp(engine: BrainEngine, options: ServeHttpOption
   // ---------------------------------------------------------------------------
   // Start server
   // ---------------------------------------------------------------------------
-  const clientCount = await sql`SELECT count(*)::int as count FROM oauth_clients`;
+  const ipcSupervisor = await startResolveIpcSupervisorForServe(
+    engine,
+    (await resolveMcpStdioSourceScope(engine)).sourceId,
+  );
+  const deregisterIpcCleanup = registerCleanup('resolve-ipc-close', async () => {
+    await ipcSupervisor.close();
+  });
 
-  const httpServer = app.listen(port, bind, () => {
-    console.error(`
+  try {
+    const clientCount = await sql`SELECT count(*)::int as count FROM oauth_clients`;
+
+    const httpServer = app.listen(port, bind, () => {
+      console.error(`
 ╔══════════════════════════════════════════════════════╗
 ║  GBrain MCP Server v${VERSION.padEnd(37)}║
 ╠══════════════════════════════════════════════════════╣
@@ -3272,48 +3281,21 @@ ${bootstrapFromEnv
     ? '║  Admin Token: hidden (non-TTY log-leak guard)        ║\n║  set $GBRAIN_ADMIN_BOOTSTRAP_TOKEN, or pass          ║\n║  --print-admin-token on a trusted terminal.          ║\n╚══════════════════════════════════════════════════════╝'
     : `║  Admin Token (paste into /admin login):              ║\n║  ${bootstrapToken.substring(0, 50)}  ║\n║  ${bootstrapToken.substring(50).padEnd(50)}  ║\n╚══════════════════════════════════════════════════════╝`}
 `);
-  });
+    });
 
-  // #4474: bind the resolve-IPC unix socket under --http too. This is the
-  // exact posture `gbrain bootstrap harness` targets — without the listener
-  // every wired lifecycle hook (SessionStart / UserPromptSubmit / PreCompact)
-  // degrades to `no_serve` forever, and on a PGLite brain there is no local
-  // recovery (the http serve owns the single-writer lock, so a second stdio
-  // serve can't provide the socket). Shares the stdio path's wiring via
-  // bindResolveIpcForServe; best-effort — failure to bind never blocks the
-  // HTTP server.
-  const ipcBinding = await bindResolveIpcForServe(
-    engine,
-    (await resolveMcpStdioSourceScope(engine)).sourceId,
-  );
-  if (ipcBinding.socketPath) {
-    console.error(`  Resolve IPC: ${ipcBinding.socketPath}`);
-  }
-
-  // SIGTERM/SIGHUP route through process-cleanup's pass and then
-  // `process.exit`, which skips cli.ts's finally-teardown — so on those
-  // signals the PGLite write handle was never closed. An unclosed PGLite
-  // can leave the control file pointing at a checkpoint record whose WAL
-  // page never reached disk; every later start then dies with
-  // `PANIC: could not locate a valid checkpoint record` (surfaced as the
-  // misleading WASM-init hint) and the daemon crash-loops until a human
-  // intervenes. Registering the engine here gives abnormal termination
-  // the same clean close the SIGINT path already gets via the cli
-  // teardown. Deregistered on normal return so the cli finally remains
-  // the single owner of orderly shutdown.
-  const deregisterIpcCleanup = registerCleanup('resolve-ipc-close', async () => {
-    ipcBinding.close();
-  });
-  const deregisterEngineCleanup = registerCleanup('pglite-engine-disconnect', () =>
-    engine.disconnect(),
-  );
-  try {
-    await waitForHttpServerLifecycle(httpServer);
+    // SIGTERM/SIGHUP route through process-cleanup's pass and then
+    // `process.exit`, which skips cli.ts's finally-teardown. Registering the
+    // engine here gives abnormal termination the same clean close as SIGINT.
+    const deregisterEngineCleanup = registerCleanup('pglite-engine-disconnect', () =>
+      engine.disconnect(),
+    );
+    try {
+      await waitForHttpServerLifecycle(httpServer);
+    } finally {
+      deregisterEngineCleanup();
+    }
   } finally {
-    // Close the IPC listener + reap the socket file on orderly shutdown
-    // (abnormal termination goes through the registered cleanup above).
-    ipcBinding.close();
+    await ipcSupervisor.close();
     deregisterIpcCleanup();
-    deregisterEngineCleanup();
   }
 }

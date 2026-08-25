@@ -66,8 +66,8 @@ const TRANSCRIPT_FIXTURE = join(REPO_ROOT, 'test', 'fixtures', 'conversation-for
 const DOCUMENTED_LIVE_SERVE_REASONS = new Set([
   'empty_block', // plumbing works, brain has nothing to volunteer yet
   'empty_window', // nothing to send (shouldn't happen here, but documented)
-  'deadline', // 800ms self-deadline on a slow box — designed fail-open
-  'server_budget', // serve's 400ms assembly budget — designed fail-open
+  'deadline', // 2600ms self-deadline on a slow box — designed fail-open
+  'server_budget', // serve's 1800ms assembly budget — designed fail-open
   'ipc_unavailable', // client timeout under load — designed fail-open
   'over_cap', // block trimmed to nothing under the 10000-char harness cap
 ]);
