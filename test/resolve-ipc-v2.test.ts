@@ -560,6 +560,33 @@ describe("server self-budget [G11]", () => {
   });
 });
 
+describe("turn-context reconnect budget", () => {
+  test("retries a short missing-socket handoff without exceeding the client budget", async () => {
+    const dir = tmpDir();
+    const sock = resolveSocketPath(dir);
+    const secret = ensureIpcSecret(dir);
+    const started = Date.now();
+    const pending = requestTurnContext(
+      sock,
+      { secret, window: [{ role: "user", text: "generic entity" }] },
+      { timeoutMs: 400 },
+    );
+
+    await Bun.sleep(40);
+    const server = await startResolveIpcServer(
+      sock,
+      { resolve: async () => null, turn_context: async () => ({ ...stubBlock, text: "context" }) },
+      { secret, boundSourceId: "default" },
+    );
+    servers.push(server!);
+
+    const resp = await pending;
+    expect(resp).not.toBe(IPC_UNAVAILABLE);
+    expect((resp as TurnContextResponse).block?.text).toBe("context");
+    expect(Date.now() - started).toBeLessThan(400);
+  });
+});
+
 describe("resolve kind honors boundSourceId [CX2-10]", () => {
   test("bound server rejects a cross-source resolve request; handler never runs", async () => {
     const dir = tmpDir();

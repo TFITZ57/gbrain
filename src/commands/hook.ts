@@ -1102,7 +1102,7 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
       return { outcome: 'degraded', reason: reasonCode(resp.error ?? 'server_error'), turns: turns.length };
     }
     const text = resp.block?.text ?? '';
-    if (!text) return { outcome: 'ok', reason: 'empty_block', turns: turns.length };
+    if (!text) return { outcome: resp.degradedReason ? 'degraded' : 'ok', reason: reasonCode(resp.degradedReason ?? 'empty_block'), turns: turns.length };
 
     // [ENG-1] The 10000-char harness cap applies to the WHOLE stdout payload;
     // the block is budgeted ≤8KB server-side, but JSON escaping inflates, so

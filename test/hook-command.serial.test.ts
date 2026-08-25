@@ -92,6 +92,7 @@ async function lastHeartbeat(): Promise<HookHeartbeatEntry | undefined> {
 async function startServer(opts: {
   dataDir: string;
   blockText?: string | null;
+  degradedReason?: string;
   secretOverride?: string;
   boundSourceId?: string;
   onRequest?: (req: TurnContextRequest) => void;
@@ -105,6 +106,9 @@ async function startServer(opts: {
       resolve: async () => null,
       turn_context: async (req) => {
         opts.onRequest?.(req);
+        if (opts.degradedReason) {
+          return { text: '', pointers: [], factsCount: 0, degradedReason: opts.degradedReason };
+        }
         if (opts.blockText == null) return null;
         return { text: opts.blockText, pointers: [], factsCount: 0 };
       },
@@ -288,6 +292,47 @@ describe('user-prompt', () => {
     const hb = await lastHeartbeat();
     expect(hb?.outcome).toBe('ok');
     expect(hb?.turns).toBe(1);
+  });
+
+  test('retries a short socket handoff inside the hook deadline', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    ensureIpcSecret(dataDir);
+    const delayedServer = Bun.sleep(40).then(() =>
+      startServer({ dataDir, blockText: 'context after reconnect' }),
+    );
+    const out = collectStdout();
+    const started = Date.now();
+    expect(
+      await runHook(['user-prompt'], {
+        ...out.io,
+        stdin: JSON.stringify({ prompt: 'generic entity' }),
+        userPromptDeadlineMs: 400,
+      }),
+    ).toBe(0);
+    await delayedServer;
+    expect(Date.now() - started).toBeLessThan(400);
+    expect(JSON.parse(out.get()).hookSpecificOutput.additionalContext).toBe('context after reconnect');
+    expect(await lastHeartbeat()).toMatchObject({ outcome: 'ok', turns: 1 });
+  });
+
+  test('server budget degradation is not mislabeled as an empty success', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    await startServer({ dataDir, degradedReason: 'server_budget' });
+    const out = collectStdout();
+    expect(
+      await runHook(['user-prompt'], {
+        ...out.io,
+        stdin: JSON.stringify({ prompt: 'generic entity' }),
+      }),
+    ).toBe(0);
+    expect(out.get()).toBe('');
+    expect(await lastHeartbeat()).toMatchObject({
+      outcome: 'degraded',
+      reason: 'server_budget',
+      turns: 1,
+    });
   });
 
   test('window = last 4 transcript turns + the current prompt', async () => {
