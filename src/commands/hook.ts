@@ -26,7 +26,7 @@
  * Events:
  *   session-start  digest to stdout from FILE reads only (≤1.5s) [A3,G4,B3,B4]
  *   user-prompt    stdin hook JSON → IPC turn_context → additionalContext
- *                  JSON on stdout (≤800ms, ≤10000 chars) [ENG-1,S3#8,A9]
+ *                  JSON on stdout (≤2600ms, ≤10000 chars) [ENG-1,S3#8,A9]
  *   stop           append to the per-session live buffer + 7-day GC [G15]
  *   session-end    transcript → secret-scanned corpus file, retention prune,
  *                  parser-drift detection, detached background workspace push
@@ -95,8 +95,8 @@ import { realpathOrResolve } from '../core/path-confine.ts';
 
 /** session-start self-deadline (plan D5). */
 export const SESSION_START_DEADLINE_MS = 1500;
-/** user-prompt hard self-deadline (plan D5/ENG-1). */
-export const USER_PROMPT_DEADLINE_MS = 800;
+/** Above the 2100ms IPC budget and below Claude Code's 3s hook timeout. */
+export const USER_PROMPT_DEADLINE_MS = 2600;
 /** MEMORY.md digest budget [A3]. */
 export const DIGEST_MEMORY_CAP_BYTES = 3072;
 /** Digest-eligible MEMORY.md sections [A3] — matched case-insensitively. */
@@ -1007,7 +1007,7 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
   // model choosing to relay its own tooling's failure). Embedded in the main
   // payload when one is written; emitted alone on every degraded path.
   // Computed INSIDE the deadline-raced closure: its sync file reads must be
-  // budgeted by the 800ms deadline, not free-ride before the race starts.
+  // budgeted by the hook deadline, not free-ride before the race starts.
   let banner: ReturnType<typeof pendingPushFailureBanner> = null;
   let wrotePayload = false;
 
@@ -1022,10 +1022,10 @@ async function hookUserPrompt(io: HookIo): Promise<number> {
     let priorContextText: string | undefined;
     if (j.transcript_path !== undefined && j.transcript_path !== null) {
       const conf = confineTranscriptPath(j.transcript_path, {
-        ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}),
+        ...(io.transcriptRoot ? { root: io.transcriptRoot } : {}), allowMissingLeaf: true,
       });
       if (!conf.ok) return { outcome: 'degraded', reason: `transcript_${conf.reason}` };
-      try {
+      if (conf.size > 0) try {
         const parsed = parseTranscript(conf.path, { maxBytes: USER_PROMPT_TRANSCRIPT_MAX_BYTES });
         turns = parsed.turns.slice(-USER_PROMPT_WINDOW_TURNS);
         // Cross-turn dedupe: feed the blocks WE previously injected this

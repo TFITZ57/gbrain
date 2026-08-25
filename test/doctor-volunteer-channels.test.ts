@@ -81,13 +81,13 @@ describe('checkVolunteerChannels', () => {
     rmSync(home, { recursive: true, force: true });
   });
 
-  test('quiet week on Postgres: engine-aware message — never sends the operator chasing hook registration (red-team)', async () => {
+  test('quiet week on Postgres: engine-aware message points at the durable IPC owner', async () => {
     const home = tmpHome('postgres');
     await withEnv({ GBRAIN_HOME: home }, async () => {
       const check = await checkVolunteerChannels(stubEngine([]));
       expect(check.status).toBe('ok');
-      expect(check.message).toContain('PGLite serve socket');
-      expect(check.message).not.toContain('RESTARTED');
+      expect(check.message).toContain('long-lived HTTP serve');
+      expect(check.message).toContain('10-second connection keepalive');
     });
     rmSync(home, { recursive: true, force: true });
   });
@@ -186,6 +186,6 @@ describe('checkVolunteerChannels', () => {
     const serverSrc = readFileSync(join(import.meta.dir, '..', 'src', 'mcp', 'server.ts'), 'utf8');
     expect(serverSrc).toContain('bindResolveIpcForServe');
     const serveHttpSrc = readFileSync(join(import.meta.dir, '..', 'src', 'commands', 'serve-http.ts'), 'utf8');
-    expect(serveHttpSrc).toContain('bindResolveIpcForServe');
+    expect(serveHttpSrc).toContain('startResolveIpcSupervisorForServe');
   });
 });

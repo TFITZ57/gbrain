@@ -47,8 +47,8 @@
  * 0600 set before readiness is announced) — no network surface.
  */
 
-import net from 'node:net';
-import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
+import net from "node:net";
+import { createHash, randomBytes, timingSafeEqual } from "node:crypto";
 import {
   existsSync,
   unlinkSync,
@@ -57,13 +57,14 @@ import {
   mkdirSync,
   readFileSync,
   writeFileSync,
-} from 'node:fs';
-import { join, dirname } from 'node:path';
-import { configDir } from '../config.ts';
-import type { EntityCandidate } from './entity-salience.ts';
-import type { WindowTurn } from './entity-salience.ts';
-import type { PointerBlock } from './retrieval-reflex.ts';
-import type { TurnContextResult } from './turn-context.ts';
+  linkSync,
+} from "node:fs";
+import { join, dirname } from "node:path";
+import { configDir } from "../config.ts";
+import type { EntityCandidate } from "./entity-salience.ts";
+import type { WindowTurn } from "./entity-salience.ts";
+import type { PointerBlock } from "./retrieval-reflex.ts";
+import type { TurnContextResult } from "./turn-context.ts";
 import type {
   SyncAbortRequest,
   SyncAbortResponse,
@@ -71,22 +72,27 @@ import type {
   SyncStartResponse,
   SyncStatusRequest,
   SyncStatusResponse,
-} from './sync-ipc.ts';
+} from "./sync-ipc.ts";
 import type {
   SweepStartRequest,
   SweepStartResponse,
   SweepStatusRequest,
   SweepStatusResponse,
-} from './sweep-ipc.ts';
+} from "./sweep-ipc.ts";
 
-const SOCK_NAME = '.gbrain-resolve.sock';
-const SECRET_NAME = '.gbrain-ipc-secret';
+const SOCK_NAME = ".gbrain-resolve.sock";
+const SECRET_NAME = ".gbrain-ipc-secret";
 /** Per-kind budgets [G11]: resolve keeps its legacy 250ms client timeout. */
 const CLIENT_TIMEOUT_MS = 250;
-/** turn_context does real assembly work — wider client budget (still <1s). */
-export const TURN_CONTEXT_CLIENT_TIMEOUT_MS = 600;
+/**
+ * turn_context does cross-region Postgres work. Its shared resolver pass is
+ * normally ~350–500ms, while a first query after pool idle or process restart
+ * has been observed near 1.5s. 2100ms leaves transport margin while the
+ * enclosing hook remains below the harness's 3s backstop.
+ */
+export const TURN_CONTEXT_CLIENT_TIMEOUT_MS = 2100;
 /** Server-side self-budget for turn_context assembly (< client timeout). */
-export const TURN_CONTEXT_SERVER_BUDGET_MS = 400;
+export const TURN_CONTEXT_SERVER_BUDGET_MS = 1800;
 /**
  * v0.45.7 ambient recall — context_pack budgets. Packs build entity CARDS
  * (heavier than turn_context's three arms), and their consumer is the
@@ -115,15 +121,27 @@ export const SYNC_ABORT_CLIENT_TIMEOUT_MS = 1000;
 export const SWEEP_START_CLIENT_TIMEOUT_MS = 1500;
 export const SWEEP_STATUS_CLIENT_TIMEOUT_MS = 1000;
 const MAX_MSG_BYTES = 256 * 1024;
+/** Drop clients that connect but never send the protocol's single request line. */
+export const IPC_REQUEST_LINE_TIMEOUT_MS = 1_000;
+/** Hard ceiling for listener teardown after all accepted sockets are destroyed. */
+export const IPC_SERVER_CLOSE_TIMEOUT_MS = 250;
+
+const serverConnections = new WeakMap<net.Server, Set<net.Socket>>();
+
+/** Filesystem identity of the socket inode a listener actually bound. */
+export interface SocketIdentity {
+  dev: number;
+  ino: number;
+}
 
 /** Marker the client returns when no server is reachable (vs. a real null result). */
-export const IPC_UNAVAILABLE = Symbol('ipc-unavailable');
+export const IPC_UNAVAILABLE = Symbol("ipc-unavailable");
 
 // ── Request / response types (discriminated union, named responses) ───────
 
 export interface ResolveRequest {
   /** Absent kind means 'resolve' — v1 clients never send it (back-compat). */
-  kind?: 'resolve';
+  kind?: "resolve";
   candidates: EntityCandidate[];
   priorContextText?: string;
   maxPointers?: number;
@@ -134,7 +152,7 @@ export interface ResolveRequest {
    */
   sourceId?: string;
   /** v0.43 (#2095, codex D7): suppression mode — 'slug-only' under windowing. */
-  suppression?: 'slug-and-title' | 'slug-only';
+  suppression?: "slug-and-title" | "slug-only";
   /**
    * v0.46.15: lexical-arms kill switch. Either side may disable: a client
    * `false` wins; otherwise the server applies its own file-config gate.
@@ -143,7 +161,7 @@ export interface ResolveRequest {
 }
 
 export interface TurnContextRequest {
-  kind: 'turn_context';
+  kind: "turn_context";
   /** Protocol version claim; the server echoes it so clients can detect a stale serve [A9]. */
   protocol: 2;
   /** Shared secret from `<dataDir>/.gbrain-ipc-secret` [S3#6]. resolve stays secret-free. */
@@ -181,7 +199,7 @@ export interface TurnContextRequest {
  * (the push path never widens — include_private is a pull-verb affordance).
  */
 export interface ContextPackRequest {
-  kind: 'context_pack';
+  kind: "context_pack";
   protocol: 2;
   secret: string;
   sessionId?: string;
@@ -248,15 +266,31 @@ export interface ContextPackResponse {
   error?: string;
 }
 
-export type ResolveHandler = (req: ResolveRequest) => Promise<PointerBlock | null>;
-export type TurnContextHandler = (req: TurnContextRequest) => Promise<TurnContextResult | null>;
-export type ContextPackHandler = (req: ContextPackRequest) => Promise<TurnContextResult | null>;
+export type ResolveHandler = (
+  req: ResolveRequest,
+) => Promise<PointerBlock | null>;
+export type TurnContextHandler = (
+  req: TurnContextRequest,
+) => Promise<TurnContextResult | null>;
+export type ContextPackHandler = (
+  req: ContextPackRequest,
+) => Promise<TurnContextResult | null>;
 
-export type SyncStartIpcHandler = (req: SyncStartRequest) => SyncStartResponse | Promise<SyncStartResponse>;
-export type SyncStatusIpcHandler = (req: SyncStatusRequest) => SyncStatusResponse | Promise<SyncStatusResponse>;
-export type SyncAbortIpcHandler = (req: SyncAbortRequest) => SyncAbortResponse | Promise<SyncAbortResponse>;
-export type SweepStartIpcHandler = (req: SweepStartRequest) => SweepStartResponse | Promise<SweepStartResponse>;
-export type SweepStatusIpcHandler = (req: SweepStatusRequest) => SweepStatusResponse | Promise<SweepStatusResponse>;
+export type SyncStartIpcHandler = (
+  req: SyncStartRequest,
+) => SyncStartResponse | Promise<SyncStartResponse>;
+export type SyncStatusIpcHandler = (
+  req: SyncStatusRequest,
+) => SyncStatusResponse | Promise<SyncStatusResponse>;
+export type SyncAbortIpcHandler = (
+  req: SyncAbortRequest,
+) => SyncAbortResponse | Promise<SyncAbortResponse>;
+export type SweepStartIpcHandler = (
+  req: SweepStartRequest,
+) => SweepStartResponse | Promise<SweepStartResponse>;
+export type SweepStatusIpcHandler = (
+  req: SweepStatusRequest,
+) => SweepStatusResponse | Promise<SweepStatusResponse>;
 
 /** Handler MAP replacing the single closure [ENG-3]. */
 export interface IpcHandlers {
@@ -288,7 +322,10 @@ export interface IpcServerOpts {
    * onDelivered: a block the client's budget abandoned was never injected
    * and must not be counted.
    */
-  onTurnContextDelivered?: (result: TurnContextResult, req: TurnContextRequest) => void;
+  onTurnContextDelivered?: (
+    result: TurnContextResult,
+    req: TurnContextRequest,
+  ) => void;
   /**
    * The server's registered source [CX2-10]. turn_context requests naming a
    * DIFFERENT sourceId are rejected with 'source_mismatch'; the handler always
@@ -301,6 +338,8 @@ export interface IpcServerOpts {
    * turn_context request is rejected 'unauthorized' (fail closed).
    */
   secret?: string;
+  /** TEST SEAM: idle request-line timeout. Production uses 1 second. */
+  requestLineTimeoutMs?: number;
 }
 
 /** Canonical socket path for a PGLite data dir. */
@@ -316,17 +355,17 @@ export function resolveSocketPath(dataDir: string): string {
  * provision paths — never world-visible.
  */
 export function ipcRunDir(): string {
-  return join(configDir(), 'run');
+  return join(configDir(), "run");
 }
 
 /** First 12 hex chars of sha256(value) — path key that never embeds the URL's credentials. */
 function hash12(value: string): string {
-  return createHash('sha256').update(value).digest('hex').slice(0, 12);
+  return createHash("sha256").update(value).digest("hex").slice(0, 12);
 }
 
 /** Minimal config slice the engine-uniform path resolvers key on (loadConfig's shape). */
 export interface IpcPathConfig {
-  engine?: 'postgres' | 'pglite';
+  engine?: "postgres" | "pglite";
   database_path?: string;
   database_url?: string;
 }
@@ -349,10 +388,13 @@ export interface IpcPathConfig {
  * the PGLite socket after a stale-socket cleanup). Bound-source rejection
  * [CX2-10] still applies per request.
  */
-export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined): string | null {
+export function resolveSocketPathForConfig(
+  cfg: IpcPathConfig | null | undefined,
+): string | null {
   if (!cfg) return null;
-  if (cfg.engine === 'pglite' && cfg.database_path) return resolveSocketPath(cfg.database_path);
-  if (cfg.engine === 'postgres' && cfg.database_url) {
+  if (cfg.engine === "pglite" && cfg.database_path)
+    return resolveSocketPath(cfg.database_path);
+  if (cfg.engine === "postgres" && cfg.database_url) {
     return join(ipcRunDir(), `resolve-${hash12(cfg.database_url)}.sock`);
   }
   return null;
@@ -363,10 +405,13 @@ export function resolveSocketPathForConfig(cfg: IpcPathConfig | null | undefined
  * keying as resolveSocketPathForConfig (data dir on PGLite, hash12-keyed
  * run-dir file on Postgres). Null = no keying material.
  */
-export function ipcSecretPathForConfig(cfg: IpcPathConfig | null | undefined): string | null {
+export function ipcSecretPathForConfig(
+  cfg: IpcPathConfig | null | undefined,
+): string | null {
   if (!cfg) return null;
-  if (cfg.engine === 'pglite' && cfg.database_path) return ipcSecretPath(cfg.database_path);
-  if (cfg.engine === 'postgres' && cfg.database_url) {
+  if (cfg.engine === "pglite" && cfg.database_path)
+    return ipcSecretPath(cfg.database_path);
+  if (cfg.engine === "postgres" && cfg.database_url) {
     return join(ipcRunDir(), `secret-${hash12(cfg.database_url)}`);
   }
   return null;
@@ -378,18 +423,22 @@ export function ipcSecretPathForConfig(cfg: IpcPathConfig | null | undefined): s
  * the file can neither be read nor created (turn_context disabled, never
  * "skip auth" — same contract as ensureIpcSecret).
  */
-export function ensureIpcSecretForConfig(cfg: IpcPathConfig | null | undefined): string | null {
+export function ensureIpcSecretForConfig(
+  cfg: IpcPathConfig | null | undefined,
+): string | null {
   const p = ipcSecretPathForConfig(cfg);
   if (!p) return null;
   return ensureIpcSecretAtPath(p);
 }
 
 /** Client-side (engine-uniform): read the config-keyed secret; null when absent. */
-export function readIpcSecretForConfig(cfg: IpcPathConfig | null | undefined): string | null {
+export function readIpcSecretForConfig(
+  cfg: IpcPathConfig | null | undefined,
+): string | null {
   const p = ipcSecretPathForConfig(cfg);
   if (!p) return null;
   try {
-    const s = readFileSync(p, 'utf8').trim();
+    const s = readFileSync(p, "utf8").trim();
     return s || null;
   } catch {
     return null;
@@ -416,23 +465,64 @@ export function ensureIpcSecret(dataDir: string): string {
 /** Path-keyed body shared by the data-dir and config-keyed secret provisioners. */
 function ensureIpcSecretAtPath(p: string): string {
   try {
-    const existing = readFileSync(p, 'utf8').trim();
+    const existing = readFileSync(p, "utf8").trim();
     if (existing) {
-      try { chmodSync(p, 0o600); } catch { /* best effort */ }
+      try {
+        chmodSync(p, 0o600);
+      } catch {
+        /* best effort */
+      }
       return existing;
     }
-  } catch { /* absent or unreadable — create below */ }
-  const secret = randomBytes(32).toString('hex');
+  } catch {
+    /* absent or unreadable — create below */
+  }
   mkdirSync(dirname(p), { recursive: true, mode: 0o700 });
-  writeFileSync(p, secret + '\n', { mode: 0o600 });
-  try { chmodSync(p, 0o600); } catch { /* best effort */ }
-  return secret;
+  try {
+    chmodSync(dirname(p), 0o700);
+  } catch {
+    /* best effort */
+  }
+
+  // Publish a fully-written candidate with one atomic hard-link operation.
+  // The target link is exclusive: one process wins, and every loser rereads
+  // the winner instead of overwriting it with a different secret.
+  const secret = randomBytes(32).toString("hex");
+  const candidate = `${p}.candidate-${process.pid}-${randomBytes(6).toString("hex")}`;
+  try {
+    writeFileSync(candidate, secret + "\n", { mode: 0o600, flag: "wx" });
+    try {
+      linkSync(candidate, p);
+      try {
+        chmodSync(p, 0o600);
+      } catch {
+        /* best effort */
+      }
+      return secret;
+    } catch (e) {
+      if ((e as NodeJS.ErrnoException).code !== "EEXIST") throw e;
+      const winner = readFileSync(p, "utf8").trim();
+      if (!winner) throw new Error("IPC secret winner published an empty file");
+      try {
+        chmodSync(p, 0o600);
+      } catch {
+        /* best effort */
+      }
+      return winner;
+    }
+  } finally {
+    try {
+      unlinkSync(candidate);
+    } catch {
+      /* best effort */
+    }
+  }
 }
 
 /** Client-side: read the shared secret; null when absent (no server has created it). */
 export function readIpcSecret(dataDir: string): string | null {
   try {
-    const s = readFileSync(ipcSecretPath(dataDir), 'utf8').trim();
+    const s = readFileSync(ipcSecretPath(dataDir), "utf8").trim();
     return s || null;
   } catch {
     return null;
@@ -441,9 +531,9 @@ export function readIpcSecret(dataDir: string): string | null {
 
 /** Constant-time secret comparison (length mismatch short-circuits — leaks length only). */
 function secretMatches(candidate: unknown, expected: string): boolean {
-  if (typeof candidate !== 'string' || !candidate || !expected) return false;
-  const a = Buffer.from(candidate, 'utf8');
-  const b = Buffer.from(expected, 'utf8');
+  if (typeof candidate !== "string" || !candidate || !expected) return false;
+  const a = Buffer.from(candidate, "utf8");
+  const b = Buffer.from(expected, "utf8");
   if (a.length !== b.length) return false;
   try {
     return timingSafeEqual(a, b);
@@ -463,14 +553,22 @@ export async function resolveViaIpc(
   socketPath: string,
   req: ResolveRequest,
 ): Promise<PointerBlock | null | typeof IPC_UNAVAILABLE> {
-  const resp = await roundTrip(socketPath, JSON.stringify(req), CLIENT_TIMEOUT_MS);
+  const resp = await roundTrip(
+    socketPath,
+    JSON.stringify(req),
+    CLIENT_TIMEOUT_MS,
+  );
   if (resp === IPC_UNAVAILABLE) return IPC_UNAVAILABLE;
-  if (resp && (resp as ResolveResponse).ok) return (resp as ResolveResponse).block ?? null;
+  if (resp && (resp as ResolveResponse).ok)
+    return (resp as ResolveResponse).block ?? null;
   return IPC_UNAVAILABLE;
 }
 
 /** Client-facing turn_context request shape (kind/protocol are filled in by the helper). */
-export type TurnContextClientRequest = Omit<TurnContextRequest, 'kind' | 'protocol'>;
+export type TurnContextClientRequest = Omit<
+  TurnContextRequest,
+  "kind" | "protocol"
+>;
 
 /**
  * Typed degraded marker for a v1 server answering a v2 request [A9] — the
@@ -478,13 +576,11 @@ export type TurnContextClientRequest = Omit<TurnContextRequest, 'kind' | 'protoc
  * not be trusted as "nothing relevant".
  */
 export interface TurnContextStaleServe {
-  degraded: 'stale_serve';
+  degraded: "stale_serve";
 }
 
 export type TurnContextIpcResult =
-  | TurnContextResponse
-  | TurnContextStaleServe
-  | typeof IPC_UNAVAILABLE;
+  TurnContextResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 
 /**
  * v2 client: request an assembled turn-context block from a running serve.
@@ -503,7 +599,7 @@ export async function requestTurnContext(
   opts: { timeoutMs?: number } = {},
 ): Promise<TurnContextIpcResult> {
   const full: TurnContextRequest = {
-    kind: 'turn_context',
+    kind: "turn_context",
     protocol: 2,
     ...req,
     window: Array.isArray(req.window) ? [...req.window] : [],
@@ -514,32 +610,45 @@ export async function requestTurnContext(
   // evicting the window first would silently hollow out candidate extraction
   // (empty blocks with ok:true) to preserve a hint. Then window turns,
   // oldest-first.
-  if (Buffer.byteLength(line, 'utf8') + 1 > MAX_MSG_BYTES && full.priorContextText) {
+  if (
+    Buffer.byteLength(line, "utf8") + 1 > MAX_MSG_BYTES &&
+    full.priorContextText
+  ) {
     delete full.priorContextText;
     line = JSON.stringify(full);
   }
-  while (Buffer.byteLength(line, 'utf8') + 1 > MAX_MSG_BYTES && full.window.length > 0) {
+  while (
+    Buffer.byteLength(line, "utf8") + 1 > MAX_MSG_BYTES &&
+    full.window.length > 0
+  ) {
     full.window.shift();
     line = JSON.stringify(full);
   }
-  if (Buffer.byteLength(line, 'utf8') + 1 > MAX_MSG_BYTES) return IPC_UNAVAILABLE;
+  if (Buffer.byteLength(line, "utf8") + 1 > MAX_MSG_BYTES)
+    return IPC_UNAVAILABLE;
 
-  const resp = await roundTrip(socketPath, line, opts.timeoutMs ?? TURN_CONTEXT_CLIENT_TIMEOUT_MS);
+  const resp = await roundTrip(
+    socketPath,
+    line,
+    opts.timeoutMs ?? TURN_CONTEXT_CLIENT_TIMEOUT_MS,
+  );
   if (resp === IPC_UNAVAILABLE) return IPC_UNAVAILABLE;
-  if (!resp || typeof resp !== 'object') return IPC_UNAVAILABLE;
+  if (!resp || typeof resp !== "object") return IPC_UNAVAILABLE;
   // Stale-serve detection [A9]: no protocol echo → a v1 server handled this
   // as a resolve request; its block is meaningless for turn_context.
-  if ((resp as { protocol?: unknown }).protocol !== 2) return { degraded: 'stale_serve' };
+  if ((resp as { protocol?: unknown }).protocol !== 2)
+    return { degraded: "stale_serve" };
   return resp as TurnContextResponse;
 }
 
 /** Client-facing context_pack request shape (kind/protocol filled in by the helper). */
-export type ContextPackClientRequest = Omit<ContextPackRequest, 'kind' | 'protocol'>;
+export type ContextPackClientRequest = Omit<
+  ContextPackRequest,
+  "kind" | "protocol"
+>;
 
 export type ContextPackIpcResult =
-  | ContextPackResponse
-  | TurnContextStaleServe
-  | typeof IPC_UNAVAILABLE;
+  ContextPackResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 
 /**
  * v0.45.7 client: request a boundary context pack (or a PreCompact entity bank)
@@ -554,39 +663,57 @@ export async function requestContextPack(
   opts: { timeoutMs?: number } = {},
 ): Promise<ContextPackIpcResult> {
   const full: ContextPackRequest = {
-    kind: 'context_pack',
+    kind: "context_pack",
     protocol: 2,
     ...req,
     ...(req.window ? { window: [...req.window] } : {}),
   };
   let line = JSON.stringify(full);
   while (
-    Buffer.byteLength(line, 'utf8') + 1 > MAX_MSG_BYTES &&
+    Buffer.byteLength(line, "utf8") + 1 > MAX_MSG_BYTES &&
     Array.isArray(full.window) &&
     full.window.length > 0
   ) {
     full.window.shift();
     line = JSON.stringify(full);
   }
-  if (Buffer.byteLength(line, 'utf8') + 1 > MAX_MSG_BYTES) return IPC_UNAVAILABLE;
+  if (Buffer.byteLength(line, "utf8") + 1 > MAX_MSG_BYTES)
+    return IPC_UNAVAILABLE;
 
-  const resp = await roundTrip(socketPath, line, opts.timeoutMs ?? CONTEXT_PACK_CLIENT_TIMEOUT_MS);
+  const resp = await roundTrip(
+    socketPath,
+    line,
+    opts.timeoutMs ?? CONTEXT_PACK_CLIENT_TIMEOUT_MS,
+  );
   if (resp === IPC_UNAVAILABLE) return IPC_UNAVAILABLE;
-  if (!resp || typeof resp !== 'object') return IPC_UNAVAILABLE;
-  if ((resp as { protocol?: unknown }).protocol !== 2) return { degraded: 'stale_serve' };
+  if (!resp || typeof resp !== "object") return IPC_UNAVAILABLE;
+  if ((resp as { protocol?: unknown }).protocol !== 2)
+    return { degraded: "stale_serve" };
   return resp as ContextPackResponse;
 }
 
 // ── Delegated-sync clients ────────────────────────────────────────────────
 
 /** Client-facing shapes (kind/protocol filled in by the helpers). */
-export type SyncStartClientRequest = Omit<SyncStartRequest, 'kind' | 'protocol'>;
-export type SyncStatusClientRequest = Omit<SyncStatusRequest, 'kind' | 'protocol'>;
-export type SyncAbortClientRequest = Omit<SyncAbortRequest, 'kind' | 'protocol'>;
+export type SyncStartClientRequest = Omit<
+  SyncStartRequest,
+  "kind" | "protocol"
+>;
+export type SyncStatusClientRequest = Omit<
+  SyncStatusRequest,
+  "kind" | "protocol"
+>;
+export type SyncAbortClientRequest = Omit<
+  SyncAbortRequest,
+  "kind" | "protocol"
+>;
 
-export type SyncStartIpcResult = SyncStartResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
-export type SyncStatusIpcResult = SyncStatusResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
-export type SyncAbortIpcResult = SyncAbortResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+export type SyncStartIpcResult =
+  SyncStartResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+export type SyncStatusIpcResult =
+  SyncStatusResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+export type SyncAbortIpcResult =
+  SyncAbortResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 
 /**
  * Delegated-sync clients: same fail-soft ladder as requestTurnContext —
@@ -601,8 +728,16 @@ export async function requestSyncStart(
   req: SyncStartClientRequest,
   opts: { timeoutMs?: number } = {},
 ): Promise<SyncStartIpcResult> {
-  const line = JSON.stringify({ kind: 'sync_start', protocol: 2, ...req } satisfies SyncStartRequest);
-  return syncRoundTrip<SyncStartResponse>(socketPath, line, opts.timeoutMs ?? SYNC_START_CLIENT_TIMEOUT_MS);
+  const line = JSON.stringify({
+    kind: "sync_start",
+    protocol: 2,
+    ...req,
+  } satisfies SyncStartRequest);
+  return syncRoundTrip<SyncStartResponse>(
+    socketPath,
+    line,
+    opts.timeoutMs ?? SYNC_START_CLIENT_TIMEOUT_MS,
+  );
 }
 
 export async function requestSyncStatus(
@@ -610,8 +745,16 @@ export async function requestSyncStatus(
   req: SyncStatusClientRequest,
   opts: { timeoutMs?: number } = {},
 ): Promise<SyncStatusIpcResult> {
-  const line = JSON.stringify({ kind: 'sync_status', protocol: 2, ...req } satisfies SyncStatusRequest);
-  return syncRoundTrip<SyncStatusResponse>(socketPath, line, opts.timeoutMs ?? SYNC_STATUS_CLIENT_TIMEOUT_MS);
+  const line = JSON.stringify({
+    kind: "sync_status",
+    protocol: 2,
+    ...req,
+  } satisfies SyncStatusRequest);
+  return syncRoundTrip<SyncStatusResponse>(
+    socketPath,
+    line,
+    opts.timeoutMs ?? SYNC_STATUS_CLIENT_TIMEOUT_MS,
+  );
 }
 
 export async function requestSyncAbort(
@@ -619,25 +762,49 @@ export async function requestSyncAbort(
   req: SyncAbortClientRequest,
   opts: { timeoutMs?: number } = {},
 ): Promise<SyncAbortIpcResult> {
-  const line = JSON.stringify({ kind: 'sync_abort', protocol: 2, ...req } satisfies SyncAbortRequest);
-  return syncRoundTrip<SyncAbortResponse>(socketPath, line, opts.timeoutMs ?? SYNC_ABORT_CLIENT_TIMEOUT_MS);
+  const line = JSON.stringify({
+    kind: "sync_abort",
+    protocol: 2,
+    ...req,
+  } satisfies SyncAbortRequest);
+  return syncRoundTrip<SyncAbortResponse>(
+    socketPath,
+    line,
+    opts.timeoutMs ?? SYNC_ABORT_CLIENT_TIMEOUT_MS,
+  );
 }
 
 // ── Delegated-sweep clients (#677) — same fail-soft ladder as sync ─────────
 
-export type SweepStartClientRequest = Omit<SweepStartRequest, 'kind' | 'protocol'>;
-export type SweepStatusClientRequest = Omit<SweepStatusRequest, 'kind' | 'protocol'>;
+export type SweepStartClientRequest = Omit<
+  SweepStartRequest,
+  "kind" | "protocol"
+>;
+export type SweepStatusClientRequest = Omit<
+  SweepStatusRequest,
+  "kind" | "protocol"
+>;
 
-export type SweepStartIpcResult = SweepStartResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
-export type SweepStatusIpcResult = SweepStatusResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+export type SweepStartIpcResult =
+  SweepStartResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
+export type SweepStatusIpcResult =
+  SweepStatusResponse | TurnContextStaleServe | typeof IPC_UNAVAILABLE;
 
 export async function requestSweepStart(
   socketPath: string,
   req: SweepStartClientRequest,
   opts: { timeoutMs?: number } = {},
 ): Promise<SweepStartIpcResult> {
-  const line = JSON.stringify({ kind: 'sweep_start', protocol: 2, ...req } satisfies SweepStartRequest);
-  return syncRoundTrip<SweepStartResponse>(socketPath, line, opts.timeoutMs ?? SWEEP_START_CLIENT_TIMEOUT_MS);
+  const line = JSON.stringify({
+    kind: "sweep_start",
+    protocol: 2,
+    ...req,
+  } satisfies SweepStartRequest);
+  return syncRoundTrip<SweepStartResponse>(
+    socketPath,
+    line,
+    opts.timeoutMs ?? SWEEP_START_CLIENT_TIMEOUT_MS,
+  );
 }
 
 export async function requestSweepStatus(
@@ -645,8 +812,16 @@ export async function requestSweepStatus(
   req: SweepStatusClientRequest,
   opts: { timeoutMs?: number } = {},
 ): Promise<SweepStatusIpcResult> {
-  const line = JSON.stringify({ kind: 'sweep_status', protocol: 2, ...req } satisfies SweepStatusRequest);
-  return syncRoundTrip<SweepStatusResponse>(socketPath, line, opts.timeoutMs ?? SWEEP_STATUS_CLIENT_TIMEOUT_MS);
+  const line = JSON.stringify({
+    kind: "sweep_status",
+    protocol: 2,
+    ...req,
+  } satisfies SweepStatusRequest);
+  return syncRoundTrip<SweepStatusResponse>(
+    socketPath,
+    line,
+    opts.timeoutMs ?? SWEEP_STATUS_CLIENT_TIMEOUT_MS,
+  );
 }
 
 async function syncRoundTrip<Resp extends { ok: boolean; protocol: 2 }>(
@@ -654,11 +829,13 @@ async function syncRoundTrip<Resp extends { ok: boolean; protocol: 2 }>(
   line: string,
   timeoutMs: number,
 ): Promise<Resp | TurnContextStaleServe | typeof IPC_UNAVAILABLE> {
-  if (Buffer.byteLength(line, 'utf8') + 1 > MAX_MSG_BYTES) return IPC_UNAVAILABLE;
+  if (Buffer.byteLength(line, "utf8") + 1 > MAX_MSG_BYTES)
+    return IPC_UNAVAILABLE;
   const resp = await roundTrip(socketPath, line, timeoutMs);
   if (resp === IPC_UNAVAILABLE) return IPC_UNAVAILABLE;
-  if (!resp || typeof resp !== 'object') return IPC_UNAVAILABLE;
-  if ((resp as { protocol?: unknown }).protocol !== 2) return { degraded: 'stale_serve' };
+  if (!resp || typeof resp !== "object") return IPC_UNAVAILABLE;
+  if ((resp as { protocol?: unknown }).protocol !== 2)
+    return { degraded: "stale_serve" };
   return resp as Resp;
 }
 
@@ -679,27 +856,31 @@ function roundTrip(
   // 11, while existsSync() on that path returns false throughout). Skip the
   // pre-check there and let the connection-level error/timeout handlers
   // below do the real "no server" detection.
-  if (process.platform !== 'win32' && !existsSync(socketPath)) {
+  if (process.platform !== "win32" && !existsSync(socketPath)) {
     return Promise.resolve(IPC_UNAVAILABLE);
   }
   return new Promise((resolve) => {
     let settled = false;
-    let buf = '';
+    let buf = "";
     const finish = (v: unknown | typeof IPC_UNAVAILABLE) => {
       if (settled) return;
       settled = true;
-      try { sock.destroy(); } catch { /* noop */ }
+      try {
+        sock.destroy();
+      } catch {
+        /* noop */
+      }
       resolve(v);
     };
     const sock = net.createConnection(socketPath);
     sock.setTimeout(timeoutMs);
-    sock.on('connect', () => {
-      sock.write(requestLine + '\n');
+    sock.on("connect", () => {
+      sock.write(requestLine + "\n");
     });
-    sock.on('data', (chunk) => {
-      buf += chunk.toString('utf8');
+    sock.on("data", (chunk) => {
+      buf += chunk.toString("utf8");
       if (buf.length > MAX_MSG_BYTES) return finish(IPC_UNAVAILABLE);
-      const nl = buf.indexOf('\n');
+      const nl = buf.indexOf("\n");
       if (nl < 0) return;
       try {
         return finish(JSON.parse(buf.slice(0, nl)));
@@ -709,20 +890,23 @@ function roundTrip(
     });
     // Any error (ENOENT, ECONNREFUSED, stale socket), timeout, or close before
     // a response → treat as unavailable, fall through the ladder.
-    sock.on('timeout', () => finish(IPC_UNAVAILABLE));
-    sock.on('error', () => finish(IPC_UNAVAILABLE));
-    sock.on('close', () => finish(IPC_UNAVAILABLE));
+    sock.on("timeout", () => finish(IPC_UNAVAILABLE));
+    sock.on("error", () => finish(IPC_UNAVAILABLE));
+    sock.on("close", () => finish(IPC_UNAVAILABLE));
   });
 }
 
 // ── Server ────────────────────────────────────────────────────────────────
 
 /**
- * Server: start an IPC listener on `socketPath`. Cleans up a stale socket
- * left by a dead owner first, hardens the parent dir to 0700, and chmods the
- * socket 0600 BEFORE announcing readiness [S3#6]. Returns the net.Server
- * (caller closes on shutdown). Errors are swallowed (best-effort feature) —
- * returns null if the socket can't be bound.
+ * Server: start an IPC listener on `socketPath`. A live listener already at
+ * the shared path wins; later serve processes become non-owners instead of
+ * unlinking it. A dead owner's stale socket is removed before bind. This is
+ * load-bearing for Postgres, where every stdio MCP client can spawn its own
+ * `gbrain serve` against the same brain. Hardens the parent dir to 0700 and
+ * chmods the socket 0600 BEFORE announcing readiness [S3#6]. Returns the
+ * net.Server (caller closes on shutdown). Errors are swallowed (best-effort
+ * feature); returns null if another live owner exists or the socket can't bind.
  *
  * Two call shapes [ENG-3]:
  *   - legacy positional: (socketPath, resolveHandler, onDelivered?) — v1
@@ -742,14 +926,17 @@ export async function startResolveIpcServer(
 export async function startResolveIpcServer(
   socketPath: string,
   handlerOrHandlers: ResolveHandler | IpcHandlers,
-  onDeliveredOrOpts?: ((block: PointerBlock, req: ResolveRequest) => void) | IpcServerOpts,
+  onDeliveredOrOpts?:
+    ((block: PointerBlock, req: ResolveRequest) => void) | IpcServerOpts,
 ): Promise<net.Server | null> {
   const handlers: IpcHandlers =
-    typeof handlerOrHandlers === 'function' ? { resolve: handlerOrHandlers } : handlerOrHandlers;
+    typeof handlerOrHandlers === "function"
+      ? { resolve: handlerOrHandlers }
+      : handlerOrHandlers;
   const opts: IpcServerOpts =
-    typeof onDeliveredOrOpts === 'function'
+    typeof onDeliveredOrOpts === "function"
       ? { onDelivered: onDeliveredOrOpts }
-      : onDeliveredOrOpts ?? {};
+      : (onDeliveredOrOpts ?? {});
 
   // [S3#6] Parent dir 0700 (create if missing, tighten if present) so an
   // unrelated local user can't even see the socket / secret names.
@@ -757,50 +944,86 @@ export async function startResolveIpcServer(
     const dir = dirname(socketPath);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
     chmodSync(dir, 0o700);
-  } catch { /* best effort */ }
+  } catch {
+    /* best effort */
+  }
 
-  // Remove a stale socket file if present (a previous serve that didn't clean up).
-  cleanupStaleSocket(socketPath);
+  // Postgres can have many stdio serve processes for one brain. Never unlink
+  // the canonical socket merely because it exists: that disconnects the live
+  // owner while its file descriptor keeps running on an unreachable inode.
+  // Probe first; ECONNREFUSED/ENOENT means a dead owner's stale file and is
+  // safe to remove. A timeout is treated as LIVE (fail closed on ownership).
+  if (process.platform !== "win32" && existsSync(socketPath)) {
+    const observed = socketIdentity(socketPath);
+    if (await socketListenerIsLive(socketPath)) return null;
+    // Another contender may have rebound the path after our failed probe.
+    // Remove only the exact inode we observed; otherwise fail closed and let
+    // the durable supervisor retry against the new owner.
+    if (!cleanupSocketIfOwned(socketPath, observed)) return null;
+  }
 
   return new Promise((resolve) => {
+    const connections = new Set<net.Socket>();
+    const requestLineTimeoutMs = Math.max(
+      10,
+      opts.requestLineTimeoutMs ?? IPC_REQUEST_LINE_TIMEOUT_MS,
+    );
     const server = net.createServer((conn) => {
-      let buf = '';
+      connections.add(conn);
+      conn.once("close", () => connections.delete(conn));
+      let buf = "";
       // One request per connection: once a line is being handled, later data
       // events are ignored. Without this, bytes arriving after the newline
       // while the async handler is mid-await would re-find the SAME first
       // line and process it concurrently — duplicate handler work, duplicate
       // response writes, and duplicated delivery-point event logging.
       let handled = false;
-      conn.setEncoding('utf8');
-      conn.on('data', async (chunk: string) => {
+      conn.setEncoding("utf8");
+      conn.setTimeout(requestLineTimeoutMs, () => conn.destroy());
+      conn.on("data", async (chunk: string) => {
         if (handled) return;
         buf += chunk;
-        if (buf.length > MAX_MSG_BYTES) { conn.destroy(); return; }
-        const nl = buf.indexOf('\n');
+        if (buf.length > MAX_MSG_BYTES) {
+          conn.destroy();
+          return;
+        }
+        const nl = buf.indexOf("\n");
         if (nl < 0) return;
         handled = true;
+        conn.setTimeout(0);
         const line = buf.slice(0, nl);
         let resp: string;
-        let delivered: { block: PointerBlock; req: ResolveRequest } | null = null;
-        let deliveredTurnContext: { result: TurnContextResult; req: TurnContextRequest } | null = null;
+        let delivered: { block: PointerBlock; req: ResolveRequest } | null =
+          null;
+        let deliveredTurnContext: {
+          result: TurnContextResult;
+          req: TurnContextRequest;
+        } | null = null;
         try {
           const parsed = JSON.parse(line) as IpcRequest;
-          const kind = (parsed as { kind?: unknown }).kind ?? 'resolve';
-          if (kind === 'resolve') {
+          const kind = (parsed as { kind?: unknown }).kind ?? "resolve";
+          if (kind === "resolve") {
             const req = parsed as ResolveRequest;
             // [CX2-10] Same source binding as turn_context: a bound server
             // serves ITS registered source only — a resolve request naming a
             // different source is rejected, never re-routed. Unbound servers
             // (legacy positional callers) keep the v1 pass-through behavior.
-            if (req.sourceId && opts.boundSourceId && req.sourceId !== opts.boundSourceId) {
-              resp = JSON.stringify({ ok: false, error: 'source_mismatch' } satisfies ResolveResponse);
+            if (
+              req.sourceId &&
+              opts.boundSourceId &&
+              req.sourceId !== opts.boundSourceId
+            ) {
+              resp = JSON.stringify({
+                ok: false,
+                error: "source_mismatch",
+              } satisfies ResolveResponse);
             } else {
               const block = await handlers.resolve(req);
               const out: ResolveResponse = { ok: true, block };
               resp = JSON.stringify(out);
               if (block) delivered = { block, req };
             }
-          } else if (kind === 'turn_context') {
+          } else if (kind === "turn_context") {
             const req = parsed as TurnContextRequest;
             const tcResp = await handleTurnContext(req, handlers, opts);
             resp = JSON.stringify(tcResp);
@@ -810,58 +1033,202 @@ export async function startResolveIpcServer(
             if (tcResp.ok && tcResp.block && tcResp.block.text) {
               deliveredTurnContext = { result: tcResp.block, req };
             }
-          } else if (kind === 'context_pack') {
+          } else if (kind === "context_pack") {
             resp = JSON.stringify(
-              await handleContextPack(parsed as ContextPackRequest, handlers, opts),
+              await handleContextPack(
+                parsed as ContextPackRequest,
+                handlers,
+                opts,
+              ),
             );
-          } else if (kind === 'sync_start') {
+          } else if (kind === "sync_start") {
             resp = JSON.stringify(
-              await handleSyncKind(parsed as SyncStartRequest, handlers.sync_start, opts),
+              await handleSyncKind(
+                parsed as SyncStartRequest,
+                handlers.sync_start,
+                opts,
+              ),
             );
-          } else if (kind === 'sync_status') {
+          } else if (kind === "sync_status") {
             resp = JSON.stringify(
-              await handleSyncKind(parsed as SyncStatusRequest, handlers.sync_status, opts),
+              await handleSyncKind(
+                parsed as SyncStatusRequest,
+                handlers.sync_status,
+                opts,
+              ),
             );
-          } else if (kind === 'sync_abort') {
+          } else if (kind === "sync_abort") {
             resp = JSON.stringify(
-              await handleSyncKind(parsed as SyncAbortRequest, handlers.sync_abort, opts),
+              await handleSyncKind(
+                parsed as SyncAbortRequest,
+                handlers.sync_abort,
+                opts,
+              ),
             );
-          } else if (kind === 'sweep_start') {
+          } else if (kind === "sweep_start") {
             resp = JSON.stringify(
-              await handleSyncKind(parsed as SweepStartRequest, handlers.sweep_start, opts),
+              await handleSyncKind(
+                parsed as SweepStartRequest,
+                handlers.sweep_start,
+                opts,
+              ),
             );
-          } else if (kind === 'sweep_status') {
+          } else if (kind === "sweep_status") {
             resp = JSON.stringify(
-              await handleSyncKind(parsed as SweepStatusRequest, handlers.sweep_status, opts),
+              await handleSyncKind(
+                parsed as SweepStatusRequest,
+                handlers.sweep_status,
+                opts,
+              ),
             );
           } else {
-            resp = JSON.stringify({ ok: false, error: `unknown_kind:${String(kind)}` });
+            resp = JSON.stringify({
+              ok: false,
+              error: `unknown_kind:${String(kind)}`,
+            });
           }
         } catch (e) {
           resp = JSON.stringify({ ok: false, error: (e as Error).message });
         }
         try {
-          conn.write(resp + '\n');
+          conn.write(resp + "\n");
           // Write accepted — the client (250ms budget) may still have hung
           // up, but this is the closest observable delivery point.
           if (delivered && opts.onDelivered) {
-            try { opts.onDelivered(delivered.block, delivered.req); } catch { /* telemetry only */ }
+            try {
+              opts.onDelivered(delivered.block, delivered.req);
+            } catch {
+              /* telemetry only */
+            }
           }
           if (deliveredTurnContext && opts.onTurnContextDelivered) {
-            try { opts.onTurnContextDelivered(deliveredTurnContext.result, deliveredTurnContext.req); } catch { /* telemetry only */ }
+            try {
+              opts.onTurnContextDelivered(
+                deliveredTurnContext.result,
+                deliveredTurnContext.req,
+              );
+            } catch {
+              /* telemetry only */
+            }
           }
-        } catch { /* client gone — do NOT log undelivered pointers */ }
+        } catch {
+          /* client gone — do NOT log undelivered pointers */
+        }
         conn.end();
       });
-      conn.on('error', () => { try { conn.destroy(); } catch { /* noop */ } });
+      conn.on("error", () => {
+        try {
+          conn.destroy();
+        } catch {
+          /* noop */
+        }
+      });
     });
-    server.on('error', () => resolve(null));
+    serverConnections.set(server, connections);
+    server.on("error", () => resolve(null));
     server.listen(socketPath, () => {
       // Mode set BEFORE readiness is announced (the resolve() below) [S3#6].
-      try { chmodSync(socketPath, 0o600); } catch { /* best effort */ }
+      try {
+        chmodSync(socketPath, 0o600);
+      } catch {
+        /* best effort */
+      }
       resolve(server);
     });
   });
+}
+
+/**
+ * Close a resolve listener without waiting forever on a client that connected
+ * but never completed a request. Accepted sockets are destroyed first; the
+ * short fallback bounds teardown even if a runtime omits the close callback.
+ */
+export function closeResolveIpcServer(
+  server: net.Server,
+  timeoutMs = IPC_SERVER_CLOSE_TIMEOUT_MS,
+): Promise<void> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(fallback);
+      serverConnections.delete(server);
+      resolve();
+    };
+    const fallback = setTimeout(finish, Math.max(10, timeoutMs));
+    fallback.unref?.();
+    try {
+      server.close(() => finish());
+    } catch {
+      finish();
+      return;
+    }
+    for (const socket of serverConnections.get(server) ?? []) {
+      try {
+        socket.destroy();
+      } catch {
+        /* best effort */
+      }
+    }
+  });
+}
+
+/**
+ * Probe whether a unix socket path has a live listener. Connect success is
+ * sufficient; no application bytes are sent. Errors mean stale/absent. A
+ * timeout is conservatively live so a saturated owner is never unlinked.
+ */
+async function socketListenerIsLive(
+  socketPath: string,
+  timeoutMs = 100,
+): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const finish = (live: boolean) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      try {
+        socket.destroy();
+      } catch {
+        /* noop */
+      }
+      resolve(live);
+    };
+    const socket = net.createConnection(socketPath);
+    const timer = setTimeout(() => finish(true), timeoutMs);
+    timer.unref?.();
+    socket.once("connect", () => finish(true));
+    socket.once("error", () => finish(false));
+  });
+}
+
+/** Capture the bound pathname's inode. Null on named-pipe platforms/absence. */
+export function socketIdentity(socketPath: string): SocketIdentity | null {
+  try {
+    const st = statSync(socketPath);
+    return { dev: st.dev, ino: st.ino };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Remove a socket only when the pathname still names the inode this owner
+ * bound. If runtime close already unlinked it, or a contender rebound the
+ * pathname before our close callback ran, do nothing.
+ */
+export function cleanupSocketIfOwned(
+  socketPath: string,
+  owner: SocketIdentity | null,
+): boolean {
+  if (!owner) return false;
+  const current = socketIdentity(socketPath);
+  if (!current || current.dev !== owner.dev || current.ino !== owner.ino)
+    return false;
+  cleanupStaleSocket(socketPath);
+  return true;
 }
 
 /** turn_context server path: auth [S3#6] → source binding [CX2-10] → budgeted assembly [G11]. */
@@ -871,34 +1238,48 @@ async function handleTurnContext(
   opts: IpcServerOpts,
 ): Promise<TurnContextResponse> {
   if (!handlers.turn_context) {
-    return { ok: false, protocol: 2, error: 'unsupported_kind' };
+    return { ok: false, protocol: 2, error: "unsupported_kind" };
   }
   if (req.protocol !== 2) {
-    return { ok: false, protocol: 2, error: 'unsupported_protocol' };
+    return { ok: false, protocol: 2, error: "unsupported_protocol" };
   }
   // Fail closed: no configured secret means NO turn_context service, not open service.
   if (!opts.secret || !secretMatches(req.secret, opts.secret)) {
-    return { ok: false, protocol: 2, error: 'unauthorized' };
+    return { ok: false, protocol: 2, error: "unauthorized" };
   }
   // [CX2-10] The server serves ITS registered source only. A request naming a
   // different source is an authorization error, not a routing hint.
-  if (req.sourceId && opts.boundSourceId && req.sourceId !== opts.boundSourceId) {
-    return { ok: false, protocol: 2, error: 'source_mismatch' };
+  if (
+    req.sourceId &&
+    opts.boundSourceId &&
+    req.sourceId !== opts.boundSourceId
+  ) {
+    return { ok: false, protocol: 2, error: "source_mismatch" };
   }
   try {
-    const budget = new Promise<'__budget__'>((r) => {
-      const t = setTimeout(() => r('__budget__'), TURN_CONTEXT_SERVER_BUDGET_MS);
+    const budget = new Promise<"__budget__">((r) => {
+      const t = setTimeout(
+        () => r("__budget__"),
+        TURN_CONTEXT_SERVER_BUDGET_MS,
+      );
       t.unref?.();
     });
     const result = await Promise.race([handlers.turn_context(req), budget]);
-    if (result === '__budget__') {
-      return { ok: true, protocol: 2, block: null, degradedReason: 'server_budget' };
+    if (result === "__budget__") {
+      return {
+        ok: true,
+        protocol: 2,
+        block: null,
+        degradedReason: "server_budget",
+      };
     }
     return {
       ok: true,
       protocol: 2,
       block: result,
-      ...(result?.degradedReason ? { degradedReason: result.degradedReason } : {}),
+      ...(result?.degradedReason
+        ? { degradedReason: result.degradedReason }
+        : {}),
     };
   } catch (e) {
     return { ok: false, protocol: 2, error: (e as Error).message };
@@ -918,31 +1299,45 @@ async function handleContextPack(
   opts: IpcServerOpts,
 ): Promise<ContextPackResponse> {
   if (!handlers.context_pack) {
-    return { ok: false, protocol: 2, error: 'unsupported_kind' };
+    return { ok: false, protocol: 2, error: "unsupported_kind" };
   }
   if (req.protocol !== 2) {
-    return { ok: false, protocol: 2, error: 'unsupported_protocol' };
+    return { ok: false, protocol: 2, error: "unsupported_protocol" };
   }
   if (!opts.secret || !secretMatches(req.secret, opts.secret)) {
-    return { ok: false, protocol: 2, error: 'unauthorized' };
+    return { ok: false, protocol: 2, error: "unauthorized" };
   }
-  if (req.sourceId && opts.boundSourceId && req.sourceId !== opts.boundSourceId) {
-    return { ok: false, protocol: 2, error: 'source_mismatch' };
+  if (
+    req.sourceId &&
+    opts.boundSourceId &&
+    req.sourceId !== opts.boundSourceId
+  ) {
+    return { ok: false, protocol: 2, error: "source_mismatch" };
   }
   try {
-    const budget = new Promise<'__budget__'>((r) => {
-      const t = setTimeout(() => r('__budget__'), CONTEXT_PACK_SERVER_BUDGET_MS + 200);
+    const budget = new Promise<"__budget__">((r) => {
+      const t = setTimeout(
+        () => r("__budget__"),
+        CONTEXT_PACK_SERVER_BUDGET_MS + 200,
+      );
       t.unref?.();
     });
     const result = await Promise.race([handlers.context_pack(req), budget]);
-    if (result === '__budget__') {
-      return { ok: true, protocol: 2, block: null, degradedReason: 'server_budget' };
+    if (result === "__budget__") {
+      return {
+        ok: true,
+        protocol: 2,
+        block: null,
+        degradedReason: "server_budget",
+      };
     }
     return {
       ok: true,
       protocol: 2,
       block: result,
-      ...(result?.degradedReason ? { degradedReason: result.degradedReason } : {}),
+      ...(result?.degradedReason
+        ? { degradedReason: result.degradedReason }
+        : {}),
     };
   } catch (e) {
     return { ok: false, protocol: 2, error: (e as Error).message };
@@ -955,15 +1350,19 @@ async function handleContextPack(
  * unsupported_protocol; missing/wrong secret → unauthorized). No budget race:
  * the handlers are O(1) in-memory operations in serve-sync-runner.ts.
  */
-async function handleSyncKind<Req extends { protocol: number; secret: string }, Resp extends { ok: boolean; protocol: 2 }>(
+async function handleSyncKind<
+  Req extends { protocol: number; secret: string },
+  Resp extends { ok: boolean; protocol: 2 },
+>(
   req: Req,
   handler: ((req: Req) => Resp | Promise<Resp>) | undefined,
   opts: IpcServerOpts,
 ): Promise<Resp | { ok: false; protocol: 2; error: string }> {
-  if (!handler) return { ok: false, protocol: 2, error: 'unsupported_kind' };
-  if (req.protocol !== 2) return { ok: false, protocol: 2, error: 'unsupported_protocol' };
+  if (!handler) return { ok: false, protocol: 2, error: "unsupported_kind" };
+  if (req.protocol !== 2)
+    return { ok: false, protocol: 2, error: "unsupported_protocol" };
   if (!opts.secret || !secretMatches(req.secret, opts.secret)) {
-    return { ok: false, protocol: 2, error: 'unauthorized' };
+    return { ok: false, protocol: 2, error: "unauthorized" };
   }
   try {
     return await handler(req);
@@ -976,8 +1375,9 @@ async function handleSyncKind<Req extends { protocol: number; secret: string }, 
 export function cleanupStaleSocket(socketPath: string): void {
   try {
     if (existsSync(socketPath)) {
-      // A unix socket shows up as a socket file; unlink unconditionally — if a
-      // live server holds it, listen() below would fail and we return null.
+      // Callers that compete for ownership must first pin the observed inode
+      // and use cleanupSocketIfOwned. This raw helper remains for explicit
+      // teardown/tests where the caller already owns the path.
       const st = statSync(socketPath);
       if (st.isSocket() || st.isFIFO() || st.isFile()) unlinkSync(socketPath);
     }

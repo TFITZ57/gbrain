@@ -329,14 +329,13 @@ export async function checkVolunteerChannels(
       }
     } catch { /* heartbeat surface is best-effort */ }
 
-    // Engine-aware quiet-channel guidance: the harness-hook lane rides the
-    // PGLite serve socket — on a Postgres brain, "check your registration and
-    // restart" can never make the channel fire (pull-mode covers Postgres).
+    // Both engines ride the config-keyed serve socket. Postgres additionally
+    // depends on the durable HTTP owner and its idle-connection keepalive.
     const cfg = (() => { try { return loadConfig(); } catch { return null; } })();
     const quietGuidance =
       cfg?.engine === 'pglite'
         ? 'if a hook adapter is installed, confirm its registration landed and the harness session was RESTARTED (hooks snapshot at session start); a serve older than this build logs NOTHING for the hook lane — restart serve on the new build to activate the feedback loop'
-        : 'note: the harness-hook channels require a PGLite serve socket — on this engine the hook lane stays quiet by design (pull-mode retrieval covers it)';
+        : 'confirm the hook registration landed, the harness session was RESTARTED, and the long-lived HTTP serve is running this build; Postgres delivery uses its config-keyed IPC socket and 10-second connection keepalive';
     const message = active.length
       ? `push-context channels active (7d): ${active.map((c) => `${c}=${channels[c].count}`).join(', ')}${heartbeatNote}`
       : `no push-context activity in 7 days — ${quietGuidance}`;
@@ -713,4 +712,3 @@ export async function checkPgliteScratchProbe(opts: {
     return { name, status: 'warn', message: `scratch probe could not run: ${msg}` };
   }
 }
-

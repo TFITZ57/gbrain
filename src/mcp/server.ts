@@ -231,7 +231,7 @@ export async function startMcpServer(engine: BrainEngine, opts: { surface?: McpS
     shuttingDown = true;
     process.stderr.write(`[gbrain-serve] shutdown: ${reason}\n`);
     try { startupSweep?.cancel(); } catch { /* noop */ }
-    ipcBinding.close();
+    void ipcBinding.close();
     // Cathedral 5: abort the in-flight checkpoint harvest + drop its queue
     // BEFORE engine.disconnect — the background-work registry's drain is
     // CLI-exit-only by contract, and a fire-and-forget DB writer surviving
