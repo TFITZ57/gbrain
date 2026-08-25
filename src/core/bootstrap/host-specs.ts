@@ -202,7 +202,7 @@ export const CLAUDE_HOOK_OUTPUT_CAP_CHARS = 10000;
 /**
  * Default per-event `timeout` (SECONDS — the settings-file unit) written by
  * the hook installer. Each sits above the command's own self-deadline
- * (session-start ≤1.5s, user-prompt ≤800ms) so the harness timeout is the
+ * (session-start ≤1.5s, user-prompt ≤2.6s) so the harness timeout is the
  * backstop, never the primary limiter; session-end parses a full transcript
  * and may push, so it gets the widest budget.
  */

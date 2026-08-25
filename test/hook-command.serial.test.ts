@@ -314,6 +314,30 @@ describe('user-prompt', () => {
     expect((await lastHeartbeat())?.turns).toBe(5);
   });
 
+  test('UserPromptSubmit falls back to prompt before Claude creates the transcript leaf', async () => {
+    const dataDir = join(tmp, 'data');
+    writePgliteConfig(dataDir);
+    let seen: TurnContextRequest | null = null;
+    await startServer({ dataDir, blockText: 'prompt fallback context', onRequest: (r) => { seen = r; } });
+    const projRoot = join(tmp, 'projects');
+    const projectDir = join(projRoot, 'p1');
+    mkdirSync(projectDir, { recursive: true });
+    const out = collectStdout();
+    await runHook(['user-prompt'], {
+      ...out.io,
+      stdin: JSON.stringify({
+        prompt: 'tell me about Acme',
+        transcript_path: join(projectDir, 'not-created-yet.jsonl'),
+        session_id: 's-new',
+      }),
+      transcriptRoot: projRoot,
+    });
+    expect(seen).not.toBeNull();
+    expect(seen!.window).toEqual([{ role: 'user', text: 'tell me about Acme' }]);
+    expect(JSON.parse(out.get()).hookSpecificOutput.additionalContext).toBe('prompt fallback context');
+    expect(await lastHeartbeat()).toMatchObject({ outcome: 'ok', turns: 1 });
+  });
+
   test('cross-turn dedupe: previously-injected blocks ride priorContextText; channel defaults to claude-code', async () => {
     const dataDir = join(tmp, 'data');
     writePgliteConfig(dataDir);
@@ -1305,9 +1329,9 @@ describe('user-prompt deadline', () => {
       await runHook(['user-prompt'], {
         ...out.io,
         stdin: JSON.stringify({ prompt: 'hello?' }),
-        // Injected deadline seam (below the 600ms IPC client timeout) so the
+        // Injected deadline seam (below the IPC client timeout) so the
         // test pins the DEADLINE path, not the client-timeout path, without
-        // an 800ms wall-clock wait.
+        // a full production wall-clock wait.
         userPromptDeadlineMs: 250,
       }),
     ).toBe(0);

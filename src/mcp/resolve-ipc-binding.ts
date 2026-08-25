@@ -18,32 +18,44 @@
  *
  * Best-effort by contract: failure to bind never blocks the serve.
  */
-import type { Server } from 'node:net';
-import type { BrainEngine } from '../core/engine.ts';
-import { loadConfig } from '../core/config.ts';
+import type { Server } from "node:net";
+import type { BrainEngine } from "../core/engine.ts";
+import { loadConfig } from "../core/config.ts";
 import {
   resolveSocketPathForConfig,
   startResolveIpcServer,
-  cleanupStaleSocket,
+  closeResolveIpcServer,
+  cleanupSocketIfOwned,
   ensureIpcSecretForConfig,
+  socketIdentity,
   type IpcHandlers,
-} from '../core/context/resolve-ipc.ts';
-import { resolveEntitiesToPointers, logDeliveredReflexPointers } from '../core/context/retrieval-reflex.ts';
-import { lexicalArmsEnabled } from '../core/context/reflex.ts';
-import { assembleTurnContext } from '../core/context/turn-context.ts';
-import { makeContextPackIpcHandler } from './context-pack-handler.ts';
-import { logTurnContextDeliveryFireAndForget } from '../core/context/volunteer-events.ts';
+} from "../core/context/resolve-ipc.ts";
+import {
+  resolveEntitiesToPointers,
+  logDeliveredReflexPointers,
+} from "../core/context/retrieval-reflex.ts";
+import { lexicalArmsEnabled } from "../core/context/reflex.ts";
+import { assembleTurnContext } from "../core/context/turn-context.ts";
+import { makeContextPackIpcHandler } from "./context-pack-handler.ts";
+import { logTurnContextDeliveryFireAndForget } from "../core/context/volunteer-events.ts";
 
 export interface ResolveIpcBinding {
   /** The bound listener, or null when binding was skipped/failed (best-effort). */
   server: Server | null;
   /** The socket path the listener bound (null when not bound). */
   socketPath: string | null;
-  /** Idempotent teardown: close the listener + reap the socket file. */
-  close(): void;
+  /** True only while this listener still owns the canonical pathname. */
+  isListening(): boolean;
+  /** Idempotent teardown: close the listener + reap only its socket inode. */
+  close(): Promise<void>;
 }
 
-const NULL_BINDING: ResolveIpcBinding = { server: null, socketPath: null, close: () => {} };
+const NULL_BINDING: ResolveIpcBinding = {
+  server: null,
+  socketPath: null,
+  isListening: () => false,
+  close: async () => {},
+};
 
 /**
  * Bind the resolve/turn_context/context_pack (+ delegated sync/sweep) IPC
@@ -67,7 +79,9 @@ export async function bindResolveIpcForServe(
     let ipcSecret: string | undefined;
     try {
       ipcSecret = ensureIpcSecretForConfig(cfg) ?? undefined;
-    } catch { /* turn_context disabled; resolve unaffected */ }
+    } catch {
+      /* turn_context disabled; resolve unaffected */
+    }
 
     // Serve-delegated sync kinds — built in their OWN try/catch so a
     // runner import/registration failure can never take resolve /
@@ -75,10 +89,13 @@ export async function bindResolveIpcForServe(
     // catch would otherwise swallow the error and start NO listener).
     // Kill switch: GBRAIN_SERVE_SYNC_IPC=0 → the kinds are simply not
     // registered and clients get 'unsupported_kind' (the polite refusal).
-    let syncHandlers: Pick<IpcHandlers, 'sync_start' | 'sync_status' | 'sync_abort'> = {};
-    if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
+    let syncHandlers: Pick<
+      IpcHandlers,
+      "sync_start" | "sync_status" | "sync_abort"
+    > = {};
+    if (process.env.GBRAIN_SERVE_SYNC_IPC !== "0") {
       try {
-        const runner = await import('../core/serve-sync-runner.ts');
+        const runner = await import("../core/serve-sync-runner.ts");
         syncHandlers = {
           sync_start: (req) =>
             runner.startDelegatedSync(engine, req.options, req.clientToken, {
@@ -96,15 +113,20 @@ export async function bindResolveIpcForServe(
     // Serve-delegated maintenance sweep (#677) — same posture, own
     // try/catch so a runner failure never takes the other kinds down.
     // Shares the GBRAIN_SERVE_SYNC_IPC kill switch (one delegation family).
-    let sweepHandlers: Pick<IpcHandlers, 'sweep_start' | 'sweep_status'> = {};
-    if (process.env.GBRAIN_SERVE_SYNC_IPC !== '0') {
+    let sweepHandlers: Pick<IpcHandlers, "sweep_start" | "sweep_status"> = {};
+    if (process.env.GBRAIN_SERVE_SYNC_IPC !== "0") {
       try {
-        const sweepRunner = await import('../core/serve-sweep-runner.ts');
+        const sweepRunner = await import("../core/serve-sweep-runner.ts");
         sweepHandlers = {
           sweep_start: (req) =>
-            sweepRunner.startDelegatedSweep(engine, req.options, req.clientToken, {
-              boundSourceId: defaultSource,
-            }),
+            sweepRunner.startDelegatedSweep(
+              engine,
+              req.options,
+              req.clientToken,
+              {
+                boundSourceId: defaultSource,
+              },
+            ),
           sweep_status: (req) => sweepRunner.getDelegatedSweepStatus(req.jobId),
         };
       } catch (e) {
@@ -138,8 +160,11 @@ export async function bindResolveIpcForServe(
               // reverting a false-fire regression on the NEXT TURN with a
               // config edit — a startup snapshot would freeze it until a
               // serve restart. loadConfig is a file read (~1ms) inside the
-              // 400ms IPC budget.
-              lexicalArms: req.lexicalArms === false ? false : lexicalArmsEnabled(loadConfig()),
+              // bounded IPC request.
+              lexicalArms:
+                req.lexicalArms === false
+                  ? false
+                  : lexicalArmsEnabled(loadConfig()),
             },
           ),
         // IPC v2 [ENG-3]: per-turn context assembly for the hook command.
@@ -170,7 +195,8 @@ export async function bindResolveIpcForServe(
         // at DELIVERY (post-write), not inside the resolver — a block the
         // client's 250ms budget abandoned was never injected, and counting it
         // would corrupt the volunteered-vs-used precision stats (red-team).
-        onDelivered: (block) => logDeliveredReflexPointers(engine, block.pointers),
+        onDelivered: (block) =>
+          logDeliveredReflexPointers(engine, block.pointers),
         // The hook lane's feedback loop (#2095 closed over turn_context):
         // the delivered block's post-trim volunteered pages + pointers land
         // in context_volunteer_events under the request's channel. Body
@@ -186,20 +212,166 @@ export async function bindResolveIpcForServe(
     // startResolveIpcServer returns null when the socket is already owned
     // by a live listener (another serve) — that serve is the IPC provider.
     if (!server) return NULL_BINDING;
+    const ownerIdentity = socketIdentity(resolveSocket);
 
-    let closed = false;
+    let closed: Promise<void> | null = null;
     return {
       server,
       socketPath: resolveSocket,
+      isListening: () => {
+        if (!server.listening) return false;
+        if (process.platform === "win32") return true;
+        const current = socketIdentity(resolveSocket);
+        return Boolean(
+          ownerIdentity &&
+          current &&
+          current.dev === ownerIdentity.dev &&
+          current.ino === ownerIdentity.ino,
+        );
+      },
       close: () => {
-        if (closed) return;
-        closed = true;
-        try { server.close(); } catch { /* noop */ }
-        cleanupStaleSocket(resolveSocket);
+        if (closed) return closed;
+        closed = closeResolveIpcServer(server).finally(() => {
+          cleanupSocketIfOwned(resolveSocket, ownerIdentity);
+        });
+        return closed;
       },
     };
   } catch {
     /* resolve IPC is best-effort; never block serve */
     return NULL_BINDING;
   }
+}
+
+/** Keep a long-lived serve competing for and monitoring the shared IPC path. */
+export interface ResolveIpcSupervisor {
+  close(): Promise<void>;
+}
+
+export interface ResolveIpcSupervisorOptions {
+  retryMs?: number;
+  monitorMs?: number;
+  keepaliveMs?: number;
+  keepaliveTimeoutMs?: number;
+  starter?: () => Promise<ResolveIpcBinding | null>;
+  keepalive?: ((signal: AbortSignal) => Promise<unknown>) | null;
+}
+
+/**
+ * A short-lived stdio serve may win the initial socket race. The HTTP serve
+ * retries until it can take ownership, then monitors the listener and rebinds
+ * after any loss. Postgres owners also issue a best-effort 10-second keepalive
+ * so the next prompt does not pay the pool's idle reconnect penalty.
+ */
+export async function startResolveIpcSupervisorForServe(
+  engine: BrainEngine,
+  defaultSource: string,
+  opts: ResolveIpcSupervisorOptions = {},
+): Promise<ResolveIpcSupervisor> {
+  const retryMs = Math.max(10, opts.retryMs ?? 250);
+  const monitorMs = Math.max(10, opts.monitorMs ?? 1_000);
+  const keepaliveMs = Math.max(10, opts.keepaliveMs ?? 10_000);
+  const keepaliveTimeoutMs = Math.max(10, opts.keepaliveTimeoutMs ?? 500);
+  const starter =
+    opts.starter ??
+    (async () => {
+      const binding = await bindResolveIpcForServe(engine, defaultSource);
+      return binding.server ? binding : null;
+    });
+  const cfg = (() => {
+    try {
+      return loadConfig();
+    } catch {
+      return null;
+    }
+  })();
+  const keepalive =
+    opts.keepalive !== undefined
+      ? opts.keepalive
+      : cfg?.engine === "postgres"
+        ? () => engine.executeRaw("SELECT 1", [])
+        : null;
+
+  let stopped = false;
+  let owner: ResolveIpcBinding | null = null;
+  let timer: ReturnType<typeof setTimeout> | null = null;
+  let active: Promise<void> | null = null;
+  let nextKeepaliveAt = Date.now() + keepaliveMs;
+  let keepaliveInFlight: Promise<unknown> | null = null;
+  let keepaliveAbort: AbortController | null = null;
+
+  const launchKeepConnectionWarm = (): void => {
+    if (!keepalive || keepaliveInFlight || Date.now() < nextKeepaliveAt) return;
+    nextKeepaliveAt = Date.now() + keepaliveMs;
+    const controller = new AbortController();
+    keepaliveAbort = controller;
+    const timeout = setTimeout(() => controller.abort(), keepaliveTimeoutMs);
+    timeout.unref?.();
+    const work = Promise.resolve().then(() => keepalive(controller.signal));
+    keepaliveInFlight = work;
+    void work
+      .catch(() => {
+        // Best effort. A real hook request still reports typed degradation, and
+        // the next keepalive interval retries without taking the HTTP serve down.
+      })
+      .finally(() => {
+        clearTimeout(timeout);
+        if (keepaliveInFlight === work) keepaliveInFlight = null;
+        if (keepaliveAbort === controller) keepaliveAbort = null;
+      });
+  };
+
+  const schedule = (delayMs: number) => {
+    if (stopped) return;
+    timer = setTimeout(() => {
+      timer = null;
+      if (active) {
+        schedule(retryMs);
+        return;
+      }
+      active = tick()
+        .catch(() => {
+          schedule(retryMs);
+        })
+        .finally(() => {
+          active = null;
+        });
+    }, delayMs);
+    timer.unref?.();
+  };
+
+  const tick = async (): Promise<void> => {
+    if (stopped) return;
+    if (owner?.isListening()) {
+      // Never await the ping: a wedged connection must not freeze ownership
+      // monitoring, reacquisition, or shutdown. Abort is signaled at the short
+      // keepalive deadline; one unresolved raw ping also suppresses overlap.
+      launchKeepConnectionWarm();
+      schedule(monitorMs);
+      return;
+    }
+    if (owner) {
+      await owner.close();
+      owner = null;
+    }
+    owner = await starter();
+    if (owner) nextKeepaliveAt = Date.now() + keepaliveMs;
+    schedule(owner ? monitorMs : retryMs);
+  };
+
+  await tick();
+  return {
+    close: async () => {
+      if (stopped) return;
+      stopped = true;
+      if (timer) clearTimeout(timer);
+      timer = null;
+      keepaliveAbort?.abort();
+      keepaliveAbort = null;
+      await active;
+      const current = owner;
+      owner = null;
+      await current?.close();
+    },
+  };
 }

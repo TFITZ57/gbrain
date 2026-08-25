@@ -21,7 +21,7 @@
  *     SEAMS: they point the hook at the bench brain without mutating
  *     process-global GBRAIN_HOME (parallel-test safe) and keep the
  *     operator's push-status files out of the measurement.
- *   - `userPromptDeadlineMs` is pinned generous (10s): the production 800ms
+ *   - `userPromptDeadlineMs` is pinned generous (10s): the production 2600ms
  *     deadline on a loaded CI runner would read as intermittent know-to-ask
  *     misses (flake, not signal). Deadline behavior itself is hook-suite
  *     territory (test/hook-user-prompt.test.ts).

@@ -121,6 +121,30 @@ describe('assembleTurnContext', () => {
     expect(hits).toBe(1);
   });
 
+  test('resolves the window once and reuses that pool for pointers + volunteers', async () => {
+    await seedPage('people/alice-example', 'Alice Example', 'Alice Example founder profile.');
+    await seedPage('companies/widget-co', 'Widget Co', 'Widget Co company page.');
+    let resolveAliasCalls = 0;
+    const countingEngine = new Proxy(engine, {
+      get(target, prop, receiver) {
+        if (prop === 'resolveAliases') {
+          return (...args: unknown[]) => {
+            resolveAliasCalls += 1;
+            return (target.resolveAliases as (...a: unknown[]) => unknown).apply(target, args);
+          };
+        }
+        const value = Reflect.get(target, prop, receiver);
+        return typeof value === 'function' ? value.bind(target) : value;
+      },
+    }) as unknown as BrainEngine;
+    const r = await assembleTurnContext(countingEngine, {
+      sourceId: 'default',
+      window: [{ role: 'user', text: 'context on Alice Example and Widget Co' }],
+    });
+    expect(r.text).toContain('people/alice-example');
+    expect(resolveAliasCalls).toBe(1);
+  });
+
   test('result.volunteered carries the POST-trim survivors (feedback-loop input, never the pre-budget pool)', async () => {
     // Two distinct entities: one resolves as a reflex pointer (subject of the
     // newest turn), the other only via the volunteer arm.

@@ -26,6 +26,7 @@
  */
 
 import { closeSync, lstatSync, openSync, readFileSync, readSync, statSync } from 'node:fs';
+import { dirname } from 'node:path';
 import { isPathContained } from '../path-confine.ts';
 import { detectWslMountRoot, translateWindowsPath } from '../wsl-paths.ts';
 import { claudeProjectsDir, type HostSpecTarget } from '../bootstrap/host-specs.ts';
@@ -71,7 +72,9 @@ export type ConfineTranscriptResult =
  * lstat'ed so a symlink is SEEN, never followed), regular file, byte cap,
  * and realpath containment in ~/.claude/projects (`isPathContained` resolves
  * intermediate symlinked directories, so a planted dir-symlink that escapes
- * the tree also fails). Fail-closed on every error.
+ * the tree also fails). `allowMissingLeaf` is only for UserPromptSubmit, where
+ * Claude can announce the transcript before creating it. That exception
+ * requires an existing, realpath-confined parent directory.
  *
  * Cross-OS install (#4522, Claude Code on the Windows host + gbrain in WSL):
  * the hook stdin's transcript_path arrives as a Windows drive literal
@@ -96,36 +99,44 @@ export type ConfineTranscriptResult =
  */
 export function confineTranscriptPath(
   p: unknown,
-  opts: { root?: string; maxBytes?: number; wslMountRoot?: string | null } = {},
+  opts: {
+    root?: string;
+    maxBytes?: number;
+    wslMountRoot?: string | null;
+    allowMissingLeaf?: boolean;
+  } = {},
 ): ConfineTranscriptResult {
   if (typeof p !== 'string' || p.length === 0) return { ok: false, reason: 'missing_path' };
   if (!p.endsWith('.jsonl')) return { ok: false, reason: 'not_jsonl' };
   const mountRoot = opts.wslMountRoot !== undefined ? opts.wslMountRoot : detectWslMountRoot();
   const translated = mountRoot !== null ? translateWindowsPath(p, mountRoot) : null;
   const candidate = translated ?? p;
+  const rootRaw = opts.root ?? claudeProjectsDir();
+  const root = (mountRoot !== null ? translateWindowsPath(rootRaw, mountRoot) : null) ?? rootRaw;
+  const derived =
+    mountRoot !== null && translated !== null && opts.root === undefined
+      ? deriveTranslatedProjectsRoot(translated, mountRoot)
+      : null;
+  const isConfined = (path: string): boolean =>
+    isPathContained(path, root) || (derived !== null && isPathContained(path, derived));
   let st: ReturnType<typeof lstatSync>;
   try {
     st = lstatSync(candidate);
-  } catch {
+  } catch (err) {
+    if (
+      opts.allowMissingLeaf === true &&
+      (err as NodeJS.ErrnoException)?.code === 'ENOENT' &&
+      isConfined(dirname(candidate))
+    ) {
+      return { ok: true, path: candidate, size: 0 };
+    }
     return { ok: false, reason: 'unreadable' };
   }
   if (st.isSymbolicLink()) return { ok: false, reason: 'symlink' };
   if (!st.isFile()) return { ok: false, reason: 'not_file' };
   const cap = opts.maxBytes ?? TRANSCRIPT_HARD_CAP_BYTES;
   if (st.size > cap) return { ok: false, reason: 'too_large' };
-  const rootRaw = opts.root ?? claudeProjectsDir();
-  const root = (mountRoot !== null ? translateWindowsPath(rootRaw, mountRoot) : null) ?? rootRaw;
-  if (!isPathContained(candidate, root)) {
-    // Cross-OS fallback (#4522): only for a path we translated ourselves and
-    // only when the caller didn't pin an explicit root.
-    const derived =
-      mountRoot !== null && translated !== null && opts.root === undefined
-        ? deriveTranslatedProjectsRoot(translated, mountRoot)
-        : null;
-    if (derived === null || !isPathContained(candidate, derived)) {
-      return { ok: false, reason: 'outside_projects_dir' };
-    }
-  }
+  if (!isConfined(candidate)) return { ok: false, reason: 'outside_projects_dir' };
   return { ok: true, path: candidate, size: st.size };
 }
 
@@ -448,4 +459,3 @@ export function toCorpusText(turns: WindowTurn[]): string {
   if (!turns.length) return '';
   return turns.map((t) => `[${t.role}]\n${t.text}`).join('\n\n') + '\n';
 }
-

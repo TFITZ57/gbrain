@@ -33,7 +33,9 @@ const URL_B = 'postgresql://user:hunter2@db.example.com:5432/brain_b';
 let tmp: string;
 
 beforeEach(() => {
-  tmp = mkdtempSync(join(tmpdir(), 'gbrain-ipc-uniform-'));
+  // macOS unix-domain socket paths cap at 104 bytes. Keep the sandbox prefix
+  // short enough for <tmp>/.gbrain/run/resolve-<hash>.sock to remain bindable.
+  tmp = mkdtempSync(join(tmpdir(), 'gbi-'));
 });
 
 afterEach(() => {

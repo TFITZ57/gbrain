@@ -193,6 +193,34 @@ describe('confineTranscriptPath [S3#8]', () => {
     if (r.ok) expect(r.size).toBeGreaterThan(0);
   });
 
+  test('accepts an absent leaf only when its existing parent is confined', () => {
+    const root = tdir();
+    const sub = join(root, 'proj-a');
+    mkdirSync(sub);
+    const missing = join(sub, 'not-created-yet.jsonl');
+    expect(confineTranscriptPath(missing, { root, allowMissingLeaf: true })).toEqual({
+      ok: true, path: missing, size: 0,
+    });
+    expect(confineTranscriptPath(join(root, 'missing-parent', 'missing.jsonl'), {
+      root, allowMissingLeaf: true,
+    })).toEqual({ ok: false, reason: 'unreadable' });
+  });
+
+  test('missing-leaf exception rejects a symlinked parent that escapes the root', () => {
+    const root = tdir();
+    const outside = join(root, '..', `gb-outside-link-${process.pid}`);
+    mkdirSync(outside);
+    const escapedParent = join(root, 'escaped');
+    symlinkSync(outside, escapedParent);
+    try {
+      expect(confineTranscriptPath(join(escapedParent, 'missing.jsonl'), {
+        root, allowMissingLeaf: true,
+      })).toEqual({ ok: false, reason: 'unreadable' });
+    } finally {
+      rmSync(outside, { recursive: true, force: true });
+    }
+  });
+
   test('rejects: outside root', () => {
     const root = tdir();
     mkdirSync(join(root, 'inside'));
