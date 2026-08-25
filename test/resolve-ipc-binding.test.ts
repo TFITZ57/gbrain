@@ -238,6 +238,29 @@ describe("durable resolve IPC owner", () => {
     expect(secondCloses).toBe(1);
   });
 
+  it("warms immediately after acquiring an owner instead of waiting one interval", async () => {
+    let pings = 0;
+    const owner: ResolveIpcBinding = {
+      server: {} as ResolveIpcBinding["server"],
+      socketPath: "/tmp/owner.sock",
+      isListening: () => true,
+      close: async () => {},
+    };
+    const supervisor = await startResolveIpcSupervisorForServe(
+      {} as BrainEngine,
+      "default",
+      {
+        keepaliveMs: 10_000,
+        keepalive: async () => {
+          pings += 1;
+        },
+        starter: async () => owner,
+      },
+    );
+    await waitFor(() => pings === 1);
+    await supervisor.close();
+  });
+
   it("keeps an owned Postgres connection warm on the configured interval", async () => {
     let pings = 0;
     const owner: ResolveIpcBinding = {
