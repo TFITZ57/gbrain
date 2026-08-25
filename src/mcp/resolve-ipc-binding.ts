@@ -258,6 +258,27 @@ export interface ResolveIpcSupervisorOptions {
 }
 
 /**
+ * Turn-context assembly fans out to two independent Postgres reads. Warming a
+ * single pool slot leaves the second read paying the idle reconnect penalty,
+ * which can consume the server's whole delivery budget. Keep both lanes warm
+ * concurrently and thread the supervisor abort signal into the raw queries.
+ */
+export async function warmResolveIpcPool(
+  engine: BrainEngine,
+  signal: AbortSignal,
+): Promise<void> {
+  if (signal.aborted) return;
+  const results = await Promise.allSettled([
+    engine.executeRaw("SELECT 1", [], { signal }),
+    engine.executeRaw("SELECT 1", [], { signal }),
+  ]);
+  const failed = results.find(
+    (result): result is PromiseRejectedResult => result.status === "rejected",
+  );
+  if (failed) throw failed.reason;
+}
+
+/**
  * A short-lived stdio serve may win the initial socket race. The HTTP serve
  * retries until it can take ownership, then monitors the listener and rebinds
  * after any loss. Postgres owners also issue a best-effort 10-second keepalive
@@ -285,11 +306,11 @@ export async function startResolveIpcSupervisorForServe(
       return null;
     }
   })();
-  const keepalive =
+  const keepalive: ((signal: AbortSignal) => Promise<unknown>) | null =
     opts.keepalive !== undefined
       ? opts.keepalive
       : cfg?.engine === "postgres"
-        ? () => engine.executeRaw("SELECT 1", [])
+        ? (signal) => warmResolveIpcPool(engine, signal)
         : null;
 
   let stopped = false;

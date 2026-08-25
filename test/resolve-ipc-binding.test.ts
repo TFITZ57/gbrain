@@ -23,6 +23,7 @@ import { join } from "node:path";
 import {
   bindResolveIpcForServe,
   startResolveIpcSupervisorForServe,
+  warmResolveIpcPool,
   type ResolveIpcBinding,
 } from "../src/mcp/resolve-ipc-binding.ts";
 import { resolveSocketPath } from "../src/core/context/resolve-ipc.ts";
@@ -157,6 +158,32 @@ describe("bindResolveIpcForServe (#4474)", () => {
 });
 
 describe("durable resolve IPC owner", () => {
+  it("warms both concurrent turn-context database lanes", async () => {
+    let calls = 0;
+    let active = 0;
+    let maxActive = 0;
+    const releases: Array<() => void> = [];
+    const engine = {
+      executeRaw: () =>
+        new Promise<unknown[]>((resolve) => {
+          calls += 1;
+          active += 1;
+          maxActive = Math.max(maxActive, active);
+          releases.push(() => {
+            active -= 1;
+            resolve([]);
+          });
+        }),
+    } as unknown as BrainEngine;
+
+    const work = warmResolveIpcPool(engine, new AbortController().signal);
+    await waitFor(() => calls === 2);
+    expect(maxActive).toBe(2);
+    for (const release of releases) release();
+    await work;
+    expect(calls).toBe(2);
+  });
+
   it("retries an initial contender loss and reacquires a lost owner", async () => {
     let attempts = 0;
     let firstListening = true;
