@@ -627,7 +627,7 @@ export async function requestTurnContext(
   if (Buffer.byteLength(line, "utf8") + 1 > MAX_MSG_BYTES)
     return IPC_UNAVAILABLE;
 
-  const resp = await roundTrip(
+  const resp = await roundTripTurnContextWithReconnect(
     socketPath,
     line,
     opts.timeoutMs ?? TURN_CONTEXT_CLIENT_TIMEOUT_MS,
@@ -639,6 +639,63 @@ export async function requestTurnContext(
   if ((resp as { protocol?: unknown }).protocol !== 2)
     return { degraded: "stale_serve" };
   return resp as TurnContextResponse;
+}
+
+const TURN_CONTEXT_RECONNECT_DELAYS_MS = [25, 50, 100] as const;
+
+type RoundTripFailureReason =
+  | "missing_socket"
+  | "connect_error"
+  | "timeout"
+  | "early_close"
+  | "parse_error"
+  | "io_error";
+
+interface RoundTripFailure {
+  failed: true;
+  reason: RoundTripFailureReason;
+}
+
+function isRoundTripFailure(value: unknown): value is RoundTripFailure {
+  return Boolean(
+    value &&
+      typeof value === "object" &&
+      (value as { failed?: unknown }).failed === true,
+  );
+}
+
+/**
+ * Retry only before a request reaches the server. Once connected, replaying a
+ * timed-out request could duplicate delivery logging and add more resolver
+ * load. One absolute deadline covers connection attempts, sleeps, and reply.
+ */
+async function roundTripTurnContextWithReconnect(
+  socketPath: string,
+  requestLine: string,
+  timeoutMs: number,
+): Promise<unknown | typeof IPC_UNAVAILABLE> {
+  const deadline = Date.now() + timeoutMs;
+  for (let attempt = 0; ; attempt += 1) {
+    const remainingMs = deadline - Date.now();
+    if (remainingMs <= 0) return IPC_UNAVAILABLE;
+    const result = await roundTripDetailed(
+      socketPath,
+      requestLine,
+      remainingMs,
+    );
+    if (!isRoundTripFailure(result)) return result;
+    if (
+      result.reason !== "missing_socket" &&
+      result.reason !== "connect_error"
+    ) {
+      return IPC_UNAVAILABLE;
+    }
+    const delayMs = TURN_CONTEXT_RECONNECT_DELAYS_MS[attempt];
+    if (delayMs === undefined || delayMs >= deadline - Date.now()) {
+      return IPC_UNAVAILABLE;
+    }
+    await new Promise<void>((resolve) => setTimeout(resolve, delayMs));
+  }
 }
 
 /** Client-facing context_pack request shape (kind/protocol filled in by the helper). */
@@ -845,6 +902,16 @@ function roundTrip(
   requestLine: string,
   timeoutMs: number,
 ): Promise<unknown | typeof IPC_UNAVAILABLE> {
+  return roundTripDetailed(socketPath, requestLine, timeoutMs).then((result) =>
+    isRoundTripFailure(result) ? IPC_UNAVAILABLE : result,
+  );
+}
+
+function roundTripDetailed(
+  socketPath: string,
+  requestLine: string,
+  timeoutMs: number,
+): Promise<unknown | RoundTripFailure> {
   // POSIX fast-path only: a Unix domain socket is a real filesystem entry, so
   // existsSync() lets the common "no server running" case skip a syscall.
   // On win32, net.createServer()/createConnection() silently translate a
@@ -857,12 +924,13 @@ function roundTrip(
   // pre-check there and let the connection-level error/timeout handlers
   // below do the real "no server" detection.
   if (process.platform !== "win32" && !existsSync(socketPath)) {
-    return Promise.resolve(IPC_UNAVAILABLE);
+    return Promise.resolve({ failed: true, reason: "missing_socket" });
   }
   return new Promise((resolve) => {
     let settled = false;
+    let connected = false;
     let buf = "";
-    const finish = (v: unknown | typeof IPC_UNAVAILABLE) => {
+    const finish = (v: unknown | RoundTripFailure) => {
       if (settled) return;
       settled = true;
       try {
@@ -875,24 +943,33 @@ function roundTrip(
     const sock = net.createConnection(socketPath);
     sock.setTimeout(timeoutMs);
     sock.on("connect", () => {
+      connected = true;
       sock.write(requestLine + "\n");
     });
     sock.on("data", (chunk) => {
       buf += chunk.toString("utf8");
-      if (buf.length > MAX_MSG_BYTES) return finish(IPC_UNAVAILABLE);
+      if (buf.length > MAX_MSG_BYTES)
+        return finish({ failed: true, reason: "parse_error" });
       const nl = buf.indexOf("\n");
       if (nl < 0) return;
       try {
         return finish(JSON.parse(buf.slice(0, nl)));
       } catch {
-        return finish(IPC_UNAVAILABLE);
+        return finish({ failed: true, reason: "parse_error" });
       }
     });
     // Any error (ENOENT, ECONNREFUSED, stale socket), timeout, or close before
     // a response → treat as unavailable, fall through the ladder.
-    sock.on("timeout", () => finish(IPC_UNAVAILABLE));
-    sock.on("error", () => finish(IPC_UNAVAILABLE));
-    sock.on("close", () => finish(IPC_UNAVAILABLE));
+    sock.on("timeout", () => finish({ failed: true, reason: "timeout" }));
+    sock.on("error", () =>
+      finish({
+        failed: true,
+        reason: connected ? "io_error" : "connect_error",
+      }),
+    );
+    sock.on("close", () =>
+      finish({ failed: true, reason: "early_close" }),
+    );
   });
 }
 
