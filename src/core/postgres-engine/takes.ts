@@ -420,7 +420,11 @@ export async function listStaleTakes(deps: PgTakesDeps): Promise<StaleTakeRow[]>
       ORDER BY t.id
       LIMIT 100000
     `;
-    return rows as unknown as StaleTakeRow[];
+    // takes.id is bigint; the driver's postgres.BigInt type hands it back as a
+    // JS BigInt, which updateTakeEmbeddings' Number.isInteger guard rejects.
+    return (rows as unknown as Array<StaleTakeRow & { take_id: number | bigint }>).map(
+      (r) => ({ ...r, take_id: Number(r.take_id) }),
+    );
   }
 
 export async function updateTakeEmbeddings(
