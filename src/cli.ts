@@ -653,6 +653,13 @@ async function main() {
     return;
   }
 
+  // JetStream local runtime: keep hot host-brain reads on the supervised
+  // loopback service. Any unavailable, unhealthy, or non-host route falls
+  // through to the canonical local engine path below.
+  if (await maybeRunFastLocalRead(op, params)) {
+    return;
+  }
+
   // Local engine path (unchanged behavior for local installs).
   const engine = await connectEngine();
   // #2084: the teardown contract (bounded drain of every background-work sink,
@@ -1604,6 +1611,92 @@ export function maybePrintConceptNudge(opName: string, params: Record<string, un
   if (opName !== 'search' || getCliOptions().quiet) return;
   const nudge = conceptNudge(String(params.query ?? ''));
   if (nudge) process.stderr.write(nudge + '\n');
+}
+
+const FAST_LOCAL_READ_OPS = new Set(['get_page', 'search', 'query']);
+
+function fastLocalReadUrl(): string {
+  return (process.env.GBRAIN_FAST_QUERY_URL || 'http://127.0.0.1:8755').replace(/\/+$/, '');
+}
+
+function fastLocalTimeoutMs(opName: string, params: Record<string, unknown>): number {
+  const envValue = process.env.GBRAIN_FAST_QUERY_TIMEOUT_MS;
+  if (envValue) {
+    const parsed = Number(envValue);
+    if (Number.isFinite(parsed) && parsed > 0) return parsed;
+  }
+  if (opName === 'query' && params.expand !== false) return 60_000;
+  return 25_000;
+}
+
+function fastLocalDebug(message: string): void {
+  if (process.env.GBRAIN_FAST_QUERY_DEBUG === '1') {
+    process.stderr.write(`[gbrain-fast] ${message}\n`);
+  }
+}
+
+async function maybeRunFastLocalRead(
+  op: Operation,
+  params: Record<string, unknown>,
+): Promise<boolean> {
+  if (!FAST_LOCAL_READ_OPS.has(op.name)) return false;
+  if (process.env.GBRAIN_FAST_QUERY_DISABLE === '1') return false;
+
+  // The loopback daemon serves the host brain only. Mounted-brain requests
+  // must use connectEngine(), including ambient cwd/env routing.
+  try {
+    const { resolveBrainId } = await import('./core/brain-resolver.ts');
+    if (resolveBrainId(getCliOptions().brain) !== 'host') return false;
+  } catch {
+    return false;
+  }
+
+  const timeoutMs = fastLocalTimeoutMs(op.name, params);
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), timeoutMs);
+  timer.unref?.();
+
+  try {
+    const response = await fetch(`${fastLocalReadUrl()}/v1/op`, {
+      method: 'POST',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ op: op.name, params, cwd: process.cwd() }),
+      signal: controller.signal,
+    });
+
+    let payload: any = null;
+    try {
+      payload = await response.json();
+    } catch {
+      payload = null;
+    }
+
+    if (!response.ok && (response.status >= 500 || response.status === 404)) {
+      fastLocalDebug(`service returned HTTP ${response.status}; falling back`);
+      return false;
+    }
+
+    if (!response.ok || !payload?.ok) {
+      const message = payload?.error?.message || `fast local service returned HTTP ${response.status}`;
+      const code = payload?.error?.code || 'fast_local_error';
+      console.error(`Error [${code}]: ${message}`);
+      if (payload?.error?.suggestion) console.error(`  Fix: ${payload.error.suggestion}`);
+      setCliExitVerdict(1);
+      return true;
+    }
+
+    const output = formatResult(op.name, payload.result, params);
+    if (output) await writeStdoutFinal(output);
+    maybePrintConceptNudge(op.name, params);
+    fastLocalDebug(`${op.name} served in ${payload.latency_ms ?? '?'}ms`);
+    return true;
+  } catch (err) {
+    const message = err instanceof Error ? err.message : String(err);
+    fastLocalDebug(`unavailable: ${message}; falling back`);
+    return false;
+  } finally {
+    clearTimeout(timer);
+  }
 }
 
 export function formatResult(
